@@ -17,7 +17,7 @@ use headless_mcp_core::{
     BackendDef, BackendError, BackendErrorKind, BackendResult, BackendTransport, InitializeResult,
     McpBackend, ToolDescriptor,
 };
-use headless_mcp_secrets::EncryptedFileSecretStore;
+use headless_mcp_secrets::{EncryptedFileSecretStore, SecretStore};
 use headless_mcp_wire::{
     decode_message, JsonRpcId, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
 };
@@ -69,29 +69,7 @@ impl HttpBackend {
 
         let default_timeout = Duration::from_secs(def.call_timeout_secs);
         let client = Self::build_client(static_token.as_deref(), default_timeout);
-
-        // Try loading a persisted token for this backend
-        let oauth2 = oauth2_config.map(|config| {
-            let mut mgr = OAuth2TokenManager::new(config);
-            if let Some(ref store) = token_store {
-                if let Some(persisted) = token_store::load_token(store, &def.id) {
-                    if persisted.is_valid() {
-                        tracing::info!(backend_id = %def.id, "loaded valid persisted OAuth2 token");
-                        mgr.set_cached_token(
-                            &persisted.access_token,
-                            persisted.refresh_token(),
-                        );
-                    } else if persisted.refresh_token().is_some() {
-                        tracing::info!(backend_id = %def.id, "loaded expired token with refresh_token");
-                        mgr.set_cached_token(
-                            &persisted.access_token,
-                            persisted.refresh_token(),
-                        );
-                    }
-                }
-            }
-            mgr
-        });
+        let oauth2 = oauth2_config.map(OAuth2TokenManager::new);
 
         Self {
             def,
@@ -136,9 +114,9 @@ impl HttpBackend {
         *client = Self::build_client(Some(token), self.default_timeout);
     }
 
-    fn persist_token(&self, access_token: &str, refresh_token: Option<&str>, expires_in: u64) {
+    async fn persist_token(&self, access_token: &str, refresh_token: Option<&str>, expires_in: u64) {
         if let Some(ref store) = self.token_store {
-            token_store::save_token(store, &self.def.id, access_token, refresh_token, expires_in);
+            token_store::save_token(store, &self.def.id, access_token, refresh_token, expires_in).await;
             tracing::debug!(backend_id = %self.def.id, "OAuth2 token persisted");
         }
     }
@@ -237,7 +215,7 @@ impl HttpBackend {
 
                         // Persist the token
                         if let Some(refresh) = oauth2_mgr.current_refresh_token() {
-                            self.persist_token(&token, Some(&refresh), 3600);
+                            self.persist_token(&token, Some(&refresh), 3600).await;
                         }
 
                         // Retry
@@ -333,6 +311,20 @@ impl McpBackend for HttpBackend {
         if self.connected.load(Ordering::SeqCst) {
             return self.initialize_result.lock().unwrap().clone()
                 .ok_or_else(|| BackendError::new(BackendErrorKind::Internal, "no cached init result"));
+        }
+
+        // Load persisted OAuth2 token if available (async, safe inside runtime)
+        if let (Some(ref store), Some(ref oauth2)) = (&self.token_store, &self.oauth2) {
+            if let Some(persisted) = token_store::load_token(store, &self.def.id).await {
+                if persisted.is_valid() {
+                    tracing::info!(backend_id = %self.def.id, "loaded valid persisted token");
+                    self.rebuild_client_with_token(&persisted.access_token);
+                    oauth2.set_cached_token(&persisted.access_token, persisted.refresh_token());
+                } else if persisted.refresh_token().is_some() {
+                    tracing::info!(backend_id = %self.def.id, "loaded expired token, will refresh");
+                    oauth2.set_cached_token(&persisted.access_token, persisted.refresh_token());
+                }
+            }
         }
 
         let result = self
