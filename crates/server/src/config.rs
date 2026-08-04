@@ -65,6 +65,12 @@ struct RawOAuth2Config {
     pub scopes: Option<String>,
     #[serde(default = "default_grant_type")]
     pub grant_type: String,
+    #[serde(default = "default_callback_port")]
+    pub callback_port: u16,
+}
+
+fn default_callback_port() -> u16 {
+    9798
 }
 
 fn default_grant_type() -> String {
@@ -200,6 +206,7 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
                     client_secret: o.client_secret.as_ref().map(|v| resolve_value(v)),
                     scopes: o.scopes.clone(),
                     grant_type: o.grant_type.clone(),
+                    callback_port: o.callback_port,
                 });
                 BackendTransport::Http {
                     url,

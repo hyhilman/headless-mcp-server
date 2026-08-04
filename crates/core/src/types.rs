@@ -84,6 +84,13 @@ pub struct OAuth2Config {
     /// Grant type: "client_credentials" (default) or "authorization_code".
     #[serde(default = "default_grant_type")]
     pub grant_type: String,
+    /// Callback port for the local OAuth2 redirect server (default: 9798).
+    #[serde(default = "default_callback_port")]
+    pub callback_port: u16,
+}
+
+fn default_callback_port() -> u16 {
+    9798
 }
 
 fn default_grant_type() -> String {

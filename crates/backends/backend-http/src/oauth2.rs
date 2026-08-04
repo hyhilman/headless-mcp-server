@@ -275,9 +275,10 @@ impl OAuth2TokenManager {
 
         tracing::info!(%backend_id, %registration_endpoint, "registering OAuth2 client");
 
+        let redirect_uri = format!("http://localhost:{}/callback", self.config.callback_port);
         let body = serde_json::json!({
             "client_name": "headless-mcp",
-            "redirect_uris": ["http://localhost:9798/callback"],
+            "redirect_uris": [redirect_uri],
             "grant_types": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_method": "none"
         });
@@ -408,30 +409,48 @@ impl OAuth2TokenManager {
             generate_pkce_plain()
         };
 
-        let redirect_uri = "http://localhost:9798/callback";
-        let scopes = self.config.scopes.as_deref().unwrap_or("mcp");
+        let redirect_port = self.config.callback_port;
+        let redirect_uri = format!("http://localhost:{redirect_port}/callback");
 
-        // Step 1: Direct the user to the authorization endpoint
-        let auth_url = format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256",
-            auth_endpoint, client_id, redirect_uri, scopes, code_challenge
+        // Use configured scopes, or fall back to discovered scopes from metadata
+        let scopes = if let Some(ref s) = self.config.scopes {
+            s.clone()
+        } else {
+            let discovered = self.discovered.lock().unwrap();
+            discovered
+                .as_ref()
+                .and_then(|d| d.auth_server_metadata.scopes_supported.clone())
+                .map(|s| s.join(" "))
+                .unwrap_or_default()
+        };
+
+        // Build auth URL — only include scope if configured
+        let mut auth_url = format!(
+            "{}?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256",
+            auth_endpoint, client_id, redirect_uri, code_challenge
         );
+        if !scopes.is_empty() {
+            auth_url.push_str(&format!("&scope={scopes}"));
+        }
 
-        tracing::info!(
-            %backend_id,
-            %auth_url,
-            "OAuth2 authorization required - open this URL in a browser"
-        );
-        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
-        eprintln!("║  OAuth2 Authorization Required                           ║");
-        eprintln!("║                                                          ║");
-        eprintln!("║  Open this URL in a browser to authorize headless-mcp:   ║");
-        eprintln!("║  {auth_url}");
-        eprintln!("║                                                          ║");
-        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+        tracing::info!(%backend_id, %auth_url, "opening browser for OAuth2 authorization");
 
-        // Step 2: Start a local server to receive the callback
-        let code = receive_callback(9798).await?;
+        println!("\n═══ Opening browser for Slack authorization ═══");
+
+        // Auto-open the browser
+        if let Err(_) = open::that(&auth_url) {
+            // Fallback: print the URL
+            eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+            eprintln!("║  OAuth2 Authorization Required                           ║");
+            eprintln!("║                                                          ║");
+            eprintln!("║  Open this URL in a browser to authorize headless-mcp:   ║");
+            eprintln!("║  {auth_url}");
+            eprintln!("║                                                          ║");
+            eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+        }
+
+        // Step 2: Start local callback server
+        let code = receive_callback(redirect_port).await?;
 
         // Step 3: Exchange code for token
         let response = self
@@ -441,7 +460,7 @@ impl OAuth2TokenManager {
                 ("grant_type", "authorization_code"),
                 ("client_id", client_id),
                 ("code", &code),
-                ("redirect_uri", redirect_uri),
+                ("redirect_uri", &redirect_uri),
                 ("code_verifier", &code_verifier),
             ])
             .send()
