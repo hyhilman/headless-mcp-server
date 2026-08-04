@@ -9,6 +9,7 @@ description = "HTTP-based MCP backend: connect to remote MCP servers over HTTP+S
 [dependencies]
 headless-mcp-core = { path = "../../core" }
 headless-mcp-wire = { path = "../../mcp-wire" }
+headless-mcp-secrets = { path = "../../secrets" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,3 +20,4 @@ reqwest.workspace = true
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+secrecy = "0.10"

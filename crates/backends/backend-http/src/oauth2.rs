@@ -72,48 +72,76 @@ impl OAuth2TokenManager {
         }
     }
 
-    /// Run the full OAuth2 discovery flow from a resource_metadata URL.
+    /// Load a cached token (from persistence layer).
+    pub fn set_cached_token(&self, access_token: &str, refresh_token: Option<&str>) {
+        let cache = TokenCache {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.map(|s| s.to_string()),
+            expires_at: Instant::now(),
+        };
+        *self.token_cache.try_lock().expect("token_cache") = Some(cache);
+    }
+
+    /// Return current refresh token for persistence.
+    pub fn current_refresh_token(&self) -> Option<String> {
+        self.token_cache.try_lock().ok()?.as_ref()?.refresh_token.clone()
+    }
+
+    /// Get a valid access token.
+    ///
+    /// If the URL is an RFC 9728 resource metadata URL (contains
+    /// "oauth-protected-resource"), we fetch it first to discover the
+    /// authorization server, then fetch RFC 8414 auth server metadata.
+    ///
+    /// If the URL is already an RFC 8414 auth server URL (contains
+    /// "oauth-authorization-server"), we fetch it directly.
     pub async fn discover(
         &self,
-        resource_metadata_url: &str,
+        discovery_url: &str,
         backend_id: &str,
     ) -> Result<DiscoveredOAuth2, BackendError> {
-        tracing::info!(%backend_id, %resource_metadata_url, "fetching OAuth2 resource metadata");
+        let auth_server_url = if discovery_url.contains("oauth-protected-resource") {
+            // Step 1: fetch RFC 9728 resource metadata
+            tracing::info!(%backend_id, %discovery_url, "fetching OAuth2 resource metadata");
 
-        // Step 1: fetch resource metadata
-        let resource_metadata: ResourceMetadata = self
-            .client
-            .get(resource_metadata_url)
-            .send()
-            .await
-            .map_err(|e| BackendError::new(
-                BackendErrorKind::Auth,
-                format!("failed to fetch resource metadata: {e}"),
-            ))?
-            .json()
-            .await
-            .map_err(|e| BackendError::new(
-                BackendErrorKind::Auth,
-                format!("failed to parse resource metadata: {e}"),
-            ))?;
+            let resource_metadata: ResourceMetadata = self
+                .client
+                .get(discovery_url)
+                .send()
+                .await
+                .map_err(|e| BackendError::new(
+                    BackendErrorKind::Auth,
+                    format!("failed to fetch resource metadata: {e}"),
+                ))?
+                .json()
+                .await
+                .map_err(|e| BackendError::new(
+                    BackendErrorKind::Auth,
+                    format!("failed to parse resource metadata: {e}"),
+                ))?;
 
-        tracing::info!(
-            %backend_id,
-            resource = %resource_metadata.resource,
-            "resource metadata fetched"
-        );
+            tracing::info!(
+                %backend_id,
+                resource = %resource_metadata.resource,
+                "resource metadata fetched"
+            );
 
-        // Step 2: fetch authorization server metadata
-        let auth_server_url = resource_metadata
-            .authorization_servers
-            .as_ref()
-            .and_then(|servers| servers.first())
-            .map(|url| format!("{url}/.well-known/oauth-authorization-server"))
-            .ok_or_else(|| BackendError::new(
-                BackendErrorKind::Auth,
-                "resource metadata has no authorization_servers",
-            ))?;
+            // Step 2: determine authorization server URL
+            resource_metadata
+                .authorization_servers
+                .as_ref()
+                .and_then(|servers| servers.first())
+                .map(|url| format!("{url}/.well-known/oauth-authorization-server"))
+                .ok_or_else(|| BackendError::new(
+                    BackendErrorKind::Auth,
+                    "resource metadata has no authorization_servers",
+                ))?
+        } else {
+            // Already an RFC 8414 auth server URL (standard well-known fallback)
+            discovery_url.to_string()
+        };
 
+        // Step 3: fetch RFC 8414 authorization server metadata
         tracing::info!(%backend_id, %auth_server_url, "fetching authorization server metadata");
 
         let auth_server_metadata: AuthServerMetadata = self
@@ -141,7 +169,13 @@ impl OAuth2TokenManager {
         );
 
         let discovered = DiscoveredOAuth2 {
-            resource_metadata,
+            resource_metadata: ResourceMetadata {
+                resource: String::new(),
+                authorization_servers: None,
+                scopes_supported: auth_server_metadata.scopes_supported.clone(),
+                bearer_methods_supported: None,
+                resource_name: None,
+            },
             auth_server_metadata,
         };
         *self.discovered.lock().unwrap() = Some(discovered.clone());
@@ -149,7 +183,7 @@ impl OAuth2TokenManager {
     }
 
     /// Get a valid access token. Runs discovery, acquires token, caches it.
-    pub async fn get_token(&self, backend_id: &str) -> Result<String, BackendError> {
+    pub async fn get_token(&self, backend_id: &str, daemon_mode: bool) -> Result<String, BackendError> {
         // Check cache first
         {
             let cache = self.token_cache.lock().await;
@@ -181,6 +215,12 @@ impl OAuth2TokenManager {
                 self.do_client_credentials(&token_endpoint, backend_id).await
             }
             "authorization_code" => {
+                if daemon_mode {
+                    return Err(BackendError::new(
+                        BackendErrorKind::Auth,
+                        "authorization_code grant requires interactive consent; run 'headless-mcp --dry-run' to authenticate",
+                    ));
+                }
                 self.do_authorization_code(&token_endpoint, backend_id).await
             }
             "urn:ietf:params:oauth:grant-type:jwt-bearer" => {
@@ -218,6 +258,68 @@ impl OAuth2TokenManager {
             return Ok(self.config.grant_type.clone());
         }
         Ok("client_credentials".to_string())
+    }
+
+    /// Dynamically register a client at the registration endpoint (RFC 7591).
+    async fn register_client(&self, backend_id: &str) -> Result<(String, Option<String>), BackendError> {
+        let discovered = self.discovered.lock().unwrap();
+        let registration_endpoint = discovered
+            .as_ref()
+            .and_then(|d| d.auth_server_metadata.registration_endpoint.clone());
+        drop(discovered);
+
+        let registration_endpoint = match registration_endpoint {
+            Some(url) => url,
+            None => return Ok((String::new(), None)),
+        };
+
+        tracing::info!(%backend_id, %registration_endpoint, "registering OAuth2 client");
+
+        let body = serde_json::json!({
+            "client_name": "headless-mcp",
+            "redirect_uris": ["http://localhost:9798/callback"],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_method": "none"
+        });
+
+        let response = self
+            .client
+            .post(&registration_endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| BackendError::new(
+                BackendErrorKind::Auth,
+                format!("dynamic client registration failed: {e}"),
+            ))?;
+
+        let status = response.status();
+        let reg: serde_json::Value = response.json().await.map_err(|e| {
+            BackendError::new(
+                BackendErrorKind::Auth,
+                format!("failed to parse registration response: {e}"),
+            )
+        })?;
+
+        if !status.is_success() {
+            return Err(BackendError::new(
+                BackendErrorKind::Auth,
+                format!("registration failed ({status}): {reg}"),
+            ));
+        }
+
+        let client_id = reg
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BackendError::new(
+                BackendErrorKind::Auth,
+                "registration response missing client_id",
+            ))?;
+
+        let client_secret = reg.get("client_secret").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        tracing::info!(%backend_id, %client_id, "OAuth2 client registered");
+        Ok((client_id.to_string(), client_secret))
     }
 
     async fn do_client_credentials(
