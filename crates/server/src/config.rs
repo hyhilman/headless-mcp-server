@@ -2,7 +2,6 @@ use headless_mcp_core::{BackendDef, BackendTransport, ConnectionMode, StderrMode
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 /// Raw deserialized config from the TOML file.
 #[derive(Debug, Deserialize)]
@@ -35,6 +34,9 @@ struct RawBackendConfig {
     pub cwd: Option<String>,
     pub url: Option<String>,
     pub bearer_token: Option<String>,
+    /// OAuth2 configuration.
+    #[serde(default)]
+    pub oauth2: Option<RawOAuth2Config>,
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default)]
@@ -52,6 +54,21 @@ fn default_connect_timeout() -> u64 {
 }
 fn default_call_timeout() -> u64 {
     30
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOAuth2Config {
+    pub token_endpoint: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub scopes: Option<String>,
+    #[serde(default = "default_grant_type")]
+    pub grant_type: String,
+}
+
+fn default_grant_type() -> String {
+    "client_credentials".to_string()
 }
 
 /// Resolved hub configuration, with backends converted to BackendDef.
@@ -177,9 +194,17 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
                     .url
                     .clone()
                     .ok_or_else(|| format!("backend '{id}': missing 'url' for http transport"))?;
+                let oauth2 = bc.oauth2.as_ref().map(|o| headless_mcp_core::OAuth2Config {
+                    token_endpoint: o.token_endpoint.clone(),
+                    client_id: o.client_id.as_ref().map(|v| resolve_value(v)),
+                    client_secret: o.client_secret.as_ref().map(|v| resolve_value(v)),
+                    scopes: o.scopes.clone(),
+                    grant_type: o.grant_type.clone(),
+                });
                 BackendTransport::Http {
                     url,
                     bearer_token: bc.bearer_token.as_ref().map(|t| resolve_value(t)),
+                    oauth2,
                 }
             }
             other => {

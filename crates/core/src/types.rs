@@ -61,9 +61,33 @@ pub enum BackendTransport {
     },
     Http {
         url: String,
-        /// Bearer token for the downstream MCP.
+        /// Bearer token for the downstream MCP (static token).
         bearer_token: Option<String>,
+        /// OAuth2 client credentials for automatic token acquisition.
+        #[serde(default)]
+        oauth2: Option<OAuth2Config>,
     },
+}
+
+/// OAuth2 configuration for a backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuth2Config {
+    /// OAuth2 token endpoint URL.
+    pub token_endpoint: Option<String>,
+    /// Client ID for the OAuth2 application.
+    pub client_id: Option<String>,
+    /// Client secret for the OAuth2 application.
+    pub client_secret: Option<String>,
+    /// Space-separated list of scopes to request.
+    #[serde(default)]
+    pub scopes: Option<String>,
+    /// Grant type: "client_credentials" (default) or "authorization_code".
+    #[serde(default = "default_grant_type")]
+    pub grant_type: String,
+}
+
+fn default_grant_type() -> String {
+    "client_credentials".to_string()
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
