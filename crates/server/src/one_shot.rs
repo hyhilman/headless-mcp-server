@@ -1,5 +1,7 @@
 use headless_mcp_core::{BackendDef, BackendTransport, McpBackend};
+use headless_mcp_secrets::EncryptedFileSecretStore;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::load_config;
@@ -12,6 +14,7 @@ pub async fn run_one_shot(
     json_args: Option<&str>,
     format: &str,
     config_path: Option<&str>,
+    token_store: Option<Arc<EncryptedFileSecretStore>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let hub_config = load_config(config_path)?;
 
@@ -65,7 +68,7 @@ pub async fn run_one_shot(
         };
 
         // Connect, check if the tool exists, call it
-        let backend = connect_stdio_backend(def)?;
+        let backend = connect_stdio_backend(def, token_store.clone())?;
         if let Err(e) = backend.connect().await {
             tracing::warn!(backend_id = %def.id, %e, "failed to connect for one-shot; skipping");
             continue;
@@ -91,7 +94,7 @@ pub async fn run_one_shot(
         .ok_or_else(|| format!("no backend found that owns tool '{tool_name}'"))?;
 
     // Connect and call
-    let backend = connect_stdio_backend(def)?;
+    let backend = connect_stdio_backend(def, token_store.clone())?;
     backend.connect().await?;
 
     let timeout = Duration::from_secs(def.call_timeout_secs);
@@ -130,17 +133,13 @@ fn parse_tool_name(tool_name: &str) -> (Option<&str>, &str) {
     }
 }
 
-fn connect_stdio_backend(def: &BackendDef) -> Result<Box<dyn McpBackend>, Box<dyn std::error::Error>> {
+fn connect_stdio_backend(def: &BackendDef, store: Option<Arc<EncryptedFileSecretStore>>) -> Result<Box<dyn McpBackend>, Box<dyn std::error::Error>> {
     match &def.transport {
         BackendTransport::Stdio { .. } => {
-            Ok(Box::new(headless_mcp_backend_stdio::StdioBackend::new(
-                def.clone(),
-            )))
+            Ok(Box::new(headless_mcp_backend_stdio::StdioBackend::new(def.clone())))
         }
         BackendTransport::Http { .. } => {
-            Ok(Box::new(headless_mcp_backend_http::HttpBackend::new(
-                def.clone(),
-            )))
+            Ok(Box::new(headless_mcp_backend_http::HttpBackend::with_store(def.clone(), store, false)))
         }
     }
 }

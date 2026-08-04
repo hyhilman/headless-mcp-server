@@ -361,7 +361,7 @@ impl McpBackend for HttpBackend {
 
     async fn call_tool(&self, name: &str, arguments: Option<Value>, _timeout: Duration) -> BackendResult<Value> {
         self.check_connected()?;
-        let params = serde_json::json!({ "name": name, "arguments": arguments.unwrap_or(Value::Null) });
+        let params = serde_json::json!({ "name": name, "arguments": arguments.unwrap_or(Value::Object(serde_json::Map::new())) });
         self.send_request("tools/call", Some(params), false).await
     }
 

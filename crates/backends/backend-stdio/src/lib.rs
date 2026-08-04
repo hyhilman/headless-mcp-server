@@ -354,7 +354,7 @@ impl McpBackend for StdioBackend {
 
         let params = serde_json::json!({
             "name": name,
-            "arguments": arguments.unwrap_or(Value::Null),
+            "arguments": arguments.unwrap_or(Value::Object(serde_json::Map::new())),
         });
 
         self.send_request("tools/call", Some(params), timeout)

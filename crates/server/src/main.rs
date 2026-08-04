@@ -61,7 +61,7 @@ async fn main() -> ExitCode {
             run_serve(http, config_path, bind_addr(bind, port), token_store).await
         }
         Some(Commands::Call { tool, args, json, format }) => {
-            run_one_shot(&tool, &args, json.as_deref(), &format, config_path).await
+            run_one_shot(&tool, &args, json.as_deref(), &format, config_path, token_store.clone()).await
         }
         Some(Commands::Tools { .. }) => run_list_tools(config_path, token_store).await,
         Some(Commands::Config) => { run_print_config(config_path); Ok(()) }
