@@ -2,3 +2,4 @@
 **/*.rs.bk
 .env
 *.secrets.json
+secrets.json
