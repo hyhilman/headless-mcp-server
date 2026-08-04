@@ -2,6 +2,7 @@ use headless_mcp_core::{BackendDef, BackendTransport, ConnectionMode, StderrMode
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Raw deserialized config from the TOML file.
 #[derive(Debug, Deserialize)]
@@ -66,14 +67,15 @@ pub struct AuthConfig {
     pub rate_limit: u32,
 }
 
-/// Resolve `{{env:VAR}}` placeholders in a string.
-fn resolve_env(raw: &str) -> String {
+/// Resolve `{{env:VAR}}` and `{{secret:NAME}}` placeholders in a string.
+fn resolve_value(raw: &str) -> String {
     let mut result = raw.to_string();
     let mut changed = true;
     while changed {
         changed = false;
-        let start = result.find("{{env:");
-        if let Some(start) = start {
+
+        // Try {{env:...}}
+        if let Some(start) = result.find("{{env:") {
             let end = match result[start..].find("}}") {
                 Some(e) => start + e + 2,
                 None => break,
@@ -82,6 +84,23 @@ fn resolve_env(raw: &str) -> String {
             let value = std::env::var(var_name).unwrap_or_default();
             result.replace_range(start..end, &value);
             changed = true;
+        }
+
+        // Try {{secret:...}}
+        if !changed {
+            if let Some(start) = result.find("{{secret:") {
+                let end = match result[start..].find("}}") {
+                    Some(e) => start + e + 2,
+                    None => break,
+                };
+                let secret_name = &result[start + 10..end - 2];
+                let env_key = format!("HEADLESS_MCP_SECRET_{}", secret_name.to_uppercase());
+                let value = std::env::var(&env_key).unwrap_or_else(|_| {
+                    format!("{{{{unresolved:{secret_name}}}}}")
+                });
+                result.replace_range(start..end, &value);
+                changed = true;
+            }
         }
     }
     result
@@ -148,7 +167,7 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
                     env: bc
                         .env
                         .iter()
-                        .map(|(k, v)| (k.clone(), resolve_env(v)))
+                        .map(|(k, v)| (k.clone(), resolve_value(v)))
                         .collect(),
                     cwd: bc.cwd.clone(),
                 }
@@ -160,7 +179,7 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
                     .ok_or_else(|| format!("backend '{id}': missing 'url' for http transport"))?;
                 BackendTransport::Http {
                     url,
-                    bearer_token: bc.bearer_token.as_ref().map(|t| resolve_env(t)),
+                    bearer_token: bc.bearer_token.as_ref().map(|t| resolve_value(t)),
                 }
             }
             other => {

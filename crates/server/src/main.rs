@@ -3,8 +3,8 @@
 //!
 //! Two modes, same binary, same config:
 //!
-//! - **Hub mode** (`headless-mcp` or `headless-mcp --http`): long-lived MCP
-//!   aggregator. Agents connect to it. It fronts all backends.
+//! - **Hub mode** (`headless-mcp` or `headless-mcp serve --http`): long-lived
+//!   MCP aggregator. Agents connect to it. It fronts all backends.
 //! - **One-shot mode** (`headless-mcp call <tool> --arg ...`): no daemon,
 //!   no agent. Reads config, connects to the backend that owns the tool,
 //!   calls it, prints the result, exits.
@@ -12,6 +12,7 @@
 mod config;
 mod one_shot;
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -22,6 +23,9 @@ use headless_mcp_server::{McpSession, TracingAuditLogger};
 
 use config::load_config;
 use one_shot::run_one_shot;
+
+const DEFAULT_HTTP_BIND: &str = "127.0.0.1:9797";
+const DEFAULT_RATE_LIMIT: u32 = 120;
 
 #[derive(Parser)]
 #[command(name = "headless-mcp", version, about = "A standalone MCP hub")]
@@ -46,13 +50,13 @@ struct Cli {
 enum Commands {
     /// Start the long-lived hub daemon
     Serve {
-        /// Unix socket path for local clients
-        #[arg(long)]
-        socket: Option<String>,
-
         /// Expose as HTTP+SSE MCP endpoint
         #[arg(long)]
         http: bool,
+
+        /// HTTP bind address (default: 127.0.0.1:9797)
+        #[arg(long)]
+        bind: Option<String>,
 
         /// HTTP port (default: 9797)
         #[arg(long, default_value = "9797")]
@@ -88,8 +92,8 @@ enum Commands {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let config_path = cli.config.as_deref();
 
-    // Setup logging
     let env_filter = if cli.verbose {
         tracing_subscriber::EnvFilter::new("debug")
     } else {
@@ -100,11 +104,24 @@ async fn main() -> ExitCode {
         .with_env_filter(env_filter)
         .init();
 
-    let config_path = cli.config.as_deref();
-
     match cli.command {
-        Some(Commands::Serve { http, .. }) => {
-            if let Err(e) = run_serve(http, config_path).await {
+        Some(Commands::Serve { http, bind, port }) => {
+            let bind_addr = if let Some(bind_str) = bind {
+                match bind_str.parse::<SocketAddr>() {
+                    Ok(addr) => addr,
+                    Err(_) => {
+                        format!("{bind_str}:{port}")
+                            .parse()
+                            .unwrap_or_else(|_| format!("{DEFAULT_HTTP_BIND}").parse().unwrap())
+                    }
+                }
+            } else {
+                format!("127.0.0.1:{port}")
+                    .parse()
+                    .unwrap_or_else(|_| DEFAULT_HTTP_BIND.parse().unwrap())
+            };
+
+            if let Err(e) = run_serve(http, config_path, bind_addr).await {
                 tracing::error!(%e, "server exited with error");
                 return ExitCode::FAILURE;
             }
@@ -115,12 +132,13 @@ async fn main() -> ExitCode {
             json,
             format,
         }) => {
-            if let Err(e) = run_one_shot(&tool, &args, json.as_deref(), &format, config_path).await {
+            if let Err(e) = run_one_shot(&tool, &args, json.as_deref(), &format, config_path).await
+            {
                 tracing::error!(%e, "call failed");
                 return ExitCode::FAILURE;
             }
         }
-        Some(Commands::Tools { server: _server }) => {
+        Some(Commands::Tools { .. }) => {
             if let Err(e) = run_list_tools(config_path).await {
                 tracing::error!(%e, "tools list failed");
                 return ExitCode::FAILURE;
@@ -137,7 +155,8 @@ async fn main() -> ExitCode {
         }
         None => {
             // Default: serve via stdio
-            if let Err(e) = run_serve(false, config_path).await {
+            if let Err(e) = run_serve(false, config_path, DEFAULT_HTTP_BIND.parse().unwrap()).await
+            {
                 tracing::error!(%e, "server exited with error");
                 return ExitCode::FAILURE;
             }
@@ -147,28 +166,13 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn run_serve(_http: bool, config_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_serve(
+    http: bool,
+    config_path: Option<&str>,
+    bind_addr: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
     let hub_config = load_config(config_path)?;
-
-    let registry = Arc::new(BackendRegistry::new());
-
-    // Register all configured backends
-    for def in &hub_config.backends {
-        let backend: Arc<dyn headless_mcp_core::McpBackend> = match &def.transport {
-            BackendTransport::Stdio { .. } => {
-                Arc::new(headless_mcp_backend_stdio::StdioBackend::new(def.clone()))
-            }
-            BackendTransport::Http { .. } => {
-                tracing::warn!(
-                    backend_id = %def.id,
-                    "HTTP backends are not yet implemented (Phase 2); skipping"
-                );
-                continue;
-            }
-        };
-
-        registry.register(def.clone(), backend).await?;
-    }
+    let registry = build_registry(&hub_config).await?;
 
     // Connect all eager backends
     let results = registry.connect_all().await;
@@ -179,11 +183,41 @@ async fn run_serve(_http: bool, config_path: Option<&str>) -> Result<(), Box<dyn
         }
     }
 
-    let session = Arc::new(McpSession::new(registry, Arc::new(TracingAuditLogger)));
+    let session = Arc::new(McpSession::new(
+        Arc::new(registry),
+        Arc::new(TracingAuditLogger),
+    ));
 
-    // In stdio mode, auth and whitelist are not applied
-    tracing::info!("headless-mcp hub starting on stdio");
-    headless_mcp_transport_stdio::run_stdio(session).await?;
+    if http {
+        let bearer_token = match &hub_config.auth {
+            Some(auth) => auth
+                .hub_token
+                .clone()
+                .unwrap_or_else(|| std::env::var("HEADLESS_MCP_TOKEN").unwrap_or_default()),
+            None => std::env::var("HEADLESS_MCP_TOKEN").unwrap_or_else(|_| {
+                tracing::warn!("HEADLESS_MCP_TOKEN not set; HTTP mode will accept any token (insecure)");
+                String::new()
+            }),
+        };
+
+        let rate_limit = hub_config
+            .auth
+            .as_ref()
+            .map(|a| a.rate_limit)
+            .unwrap_or(DEFAULT_RATE_LIMIT);
+
+        let transport_config = headless_mcp_transport_http::HttpTransportConfig {
+            bind_addr,
+            bearer_token,
+            rate_limit_per_minute: rate_limit,
+        };
+
+        tracing::info!("headless-mcp hub starting on HTTP");
+        headless_mcp_transport_http::run_http(session, transport_config).await?;
+    } else {
+        tracing::info!("headless-mcp hub starting on stdio");
+        headless_mcp_transport_stdio::run_stdio(session).await?;
+    }
 
     Ok(())
 }
@@ -192,7 +226,6 @@ async fn run_list_tools(config_path: Option<&str>) -> Result<(), Box<dyn std::er
     let hub_config = load_config(config_path)?;
     let registry = build_registry(&hub_config).await?;
 
-    // Connect all eager backends so we can see their tools
     let results = registry.connect_all().await;
     for (id, result) in &results {
         match result {
@@ -262,9 +295,14 @@ fn run_print_config(config_path: Option<&str>) {
                 };
                 let ns = def.namespace.as_deref().unwrap_or("<none>");
                 println!(
-                    "  {:<20} transport: {:<30} namespace: {:<15} mode: {:?}",
+                    "  {:<20} transport: {:<40} namespace: {:<15} mode: {:?}",
                     def.id, transport_str, ns, def.connection_mode
                 );
+            }
+            if let Some(auth) = &hub_config.auth {
+                println!("Auth: token={}, rate_limit={}", 
+                    auth.hub_token.as_deref().map(|_| "<set>").unwrap_or("<none>"),
+                    auth.rate_limit);
             }
         }
         Err(e) => {
@@ -274,21 +312,17 @@ fn run_print_config(config_path: Option<&str>) {
 }
 
 async fn build_registry(
-    config: &config::HubConfig,
+    hub_config: &config::HubConfig,
 ) -> Result<BackendRegistry, Box<dyn std::error::Error>> {
     let registry = BackendRegistry::new();
 
-    for def in &config.backends {
+    for def in &hub_config.backends {
         let backend: Arc<dyn headless_mcp_core::McpBackend> = match &def.transport {
             BackendTransport::Stdio { .. } => {
                 Arc::new(headless_mcp_backend_stdio::StdioBackend::new(def.clone()))
             }
             BackendTransport::Http { .. } => {
-                tracing::warn!(
-                    backend_id = %def.id,
-                    "HTTP backends are not yet implemented (Phase 2); skipping"
-                );
-                continue;
+                Arc::new(headless_mcp_backend_http::HttpBackend::new(def.clone()))
             }
         };
 

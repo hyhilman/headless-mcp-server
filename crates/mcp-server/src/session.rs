@@ -216,8 +216,8 @@ fn make_error_result(message: String) -> Value {
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
+    use crate::audit::TracingAuditLogger;
     use headless_mcp_wire::{JsonRpcId, JsonRpcNotification as WireNotification};
-    use serde_json::json;
     use std::sync::Mutex as StdMutex;
 
     use super::*;

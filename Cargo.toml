@@ -7,7 +7,9 @@ members = [
     "crates/mcp-wire",
     "crates/mcp-server",
     "crates/transport-stdio",
+    "crates/transport-http",
     "crates/backends/backend-stdio",
+    "crates/backends/backend-http",
     "crates/server",
 ]
 
@@ -29,6 +31,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+axum = "0.7"
+governor = "0.6"
+subtle = "2"
 
 [profile.release]
 lto = true

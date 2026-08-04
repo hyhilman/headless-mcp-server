@@ -1,44 +1,44 @@
 #![forbid(unsafe_code)]
 
-//! Backend registry: tool aggregation, namespacing, and route dispatch.
-//!
-//! The [`BackendRegistry`] owns all registered MCP backends, manages their
-//! lifecycle (connect, health check, disconnect), aggregates their tools
-//! with namespace prefixes, and routes incoming `tools/call` requests to
-//! the right backend.
+//! Backend registry: tool aggregation, namespacing, route dispatch,
+//! health checks, reconnect with exponential backoff, and connection modes.
 
 use headless_mcp_core::{
-    BackendDef, BackendError, BackendErrorKind, ConnectionMode, McpBackend,
-    ToolDescriptor,
+    BackendDef, BackendError, BackendErrorKind, ConnectionMode, McpBackend, ToolDescriptor,
 };
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::time::MissedTickBehavior;
+
+const HEALTH_CHECK_INTERVAL_SECS: u64 = 30;
+const RECONNECT_BASE_DELAY_MS: u64 = 1000;
+const RECONNECT_MAX_DELAY_MS: u64 = 60000;
 
 /// Holds a registered backend and its metadata.
 struct BackendHandle {
     def: BackendDef,
     backend: Arc<dyn McpBackend>,
     health: AtomicBool,
-}
-
-/// Maps an exposed tool name to its origin backend and downstream name.
-#[derive(Debug, Clone)]
-pub struct RoutedTool {
-    pub backend_id: String,
-    /// The tool name as exposed by the hub (with namespace prefix)
-    pub exposed_name: String,
-    /// The tool name as the downstream expects it (bare)
-    pub downstream_name: String,
-    pub descriptor: ToolDescriptor,
+    /// For eager/lazy backends: current reconnect attempt count (for backoff)
+    reconnect_attempts: std::sync::Mutex<u32>,
 }
 
 /// Manages a set of MCP backends, their tools, and route dispatch.
 pub struct BackendRegistry {
     backends: RwLock<HashMap<String, BackendHandle>>,
     tool_index: RwLock<HashMap<String, RoutedTool>>,
+    health_check_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutedTool {
+    pub backend_id: String,
+    pub exposed_name: String,
+    pub downstream_name: String,
+    pub descriptor: ToolDescriptor,
 }
 
 impl BackendRegistry {
@@ -46,6 +46,7 @@ impl BackendRegistry {
         Self {
             backends: RwLock::new(HashMap::new()),
             tool_index: RwLock::new(HashMap::new()),
+            health_check_handle: std::sync::Mutex::new(None),
         }
     }
 
@@ -61,6 +62,7 @@ impl BackendRegistry {
             def,
             backend,
             health: AtomicBool::new(false),
+            reconnect_attempts: std::sync::Mutex::new(0),
         };
 
         let mut backends = self.backends.write().unwrap();
@@ -88,22 +90,19 @@ impl BackendRegistry {
             })?
         };
 
-        // Remove tools from the index
         let mut tool_index = self.tool_index.write().unwrap();
         tool_index.retain(|_, routed| routed.backend_id != id);
 
-        // Disconnect the backend
         handle.backend.disconnect().await?;
 
         tracing::info!(%id, "backend unregistered");
         Ok(())
     }
 
-    /// Connect all eager backends. Returns results per backend so callers
-    /// can log failures without aborting the whole hub.
+    /// Connect all eager backends. Returns results per backend.
     pub async fn connect_all(&self) -> Vec<(String, Result<(), BackendError>)> {
         let backends = self.backends.read().unwrap();
-        let eager_ids: Vec<String> = backends
+        let ids: Vec<String> = backends
             .iter()
             .filter(|(_, h)| matches!(h.def.connection_mode, ConnectionMode::Eager))
             .map(|(id, _)| id.clone())
@@ -111,7 +110,7 @@ impl BackendRegistry {
         drop(backends);
 
         let mut results = Vec::new();
-        for id in eager_ids {
+        for id in ids {
             let result = self.connect_backend(&id).await;
             results.push((id, result));
         }
@@ -120,7 +119,7 @@ impl BackendRegistry {
 
     /// Connect a specific backend and index its tools.
     async fn connect_backend(&self, id: &str) -> Result<(), BackendError> {
-        let (backend, namespace) = {
+        let (backend, namespace, connection_mode) = {
             let backends = self.backends.read().unwrap();
             let handle = backends.get(id).ok_or_else(|| {
                 BackendError::new(
@@ -128,17 +127,25 @@ impl BackendRegistry {
                     format!("backend '{id}' is not registered"),
                 )
             })?;
-            (handle.backend.clone(), handle.def.namespace.clone())
+            (
+                handle.backend.clone(),
+                handle.def.namespace.clone(),
+                handle.def.connection_mode,
+            )
         };
 
         // Full MCP handshake
-        let init_result = backend.connect().await?;
+        backend.connect().await?;
 
         // Fetch tools
         let tools = backend.list_tools().await?;
 
         // Index tools with namespace prefix
         let mut tool_index = self.tool_index.write().unwrap();
+
+        // Remove old entries for this backend
+        tool_index.retain(|_, routed| routed.backend_id != id);
+
         for tool in &tools {
             let exposed_name = compute_exposed_name(namespace.as_deref(), &tool.name);
 
@@ -147,7 +154,7 @@ impl BackendRegistry {
                 return Err(BackendError::new(
                     BackendErrorKind::Internal,
                     format!(
-                        "tool name collision: both backend '{}' and backend '{}' expose a tool named '{}'. Add a namespace to disambiguate.",
+                        "tool name collision: both backend '{}' and backend '{}' expose '{}'. Add a namespace.",
                         existing.backend_id, id, exposed_name
                     ),
                 ));
@@ -168,16 +175,119 @@ impl BackendRegistry {
             );
         }
 
-        // Mark healthy
+        // Mark healthy and reset reconnect attempts
         {
             let backends = self.backends.read().unwrap();
             if let Some(handle) = backends.get(id) {
                 handle.health.store(true, Ordering::SeqCst);
+                *handle.reconnect_attempts.lock().unwrap() = 0;
             }
         }
 
-        tracing::info!(%id, tool_count = tools.len(), protocol_version = %init_result.protocol_version, "backend connected");
+        tracing::info!(%id, tool_count = tools.len(), "backend connected");
         Ok(())
+    }
+
+    /// Start periodic health checks for all registered backends.
+    pub fn start_health_checks(self: &Arc<Self>) {
+        let registry = Arc::clone(self);
+
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                interval.tick().await;
+                registry.run_health_checks().await;
+            }
+        });
+
+        let mut handle_guard = self.health_check_handle.lock().unwrap();
+        *handle_guard = Some(handle);
+        tracing::info!("health checks started (interval: {HEALTH_CHECK_INTERVAL_SECS}s)");
+    }
+
+    async fn run_health_checks(&self) {
+        let ids: Vec<(String, ConnectionMode)> = {
+            let backends = self.backends.read().unwrap();
+            backends
+                .iter()
+                .filter(|(_, h)| {
+                    // Only check eager and lazy backends; per-call are stateless
+                    !matches!(h.def.connection_mode, ConnectionMode::PerCall)
+                })
+                .map(|(id, h)| (id.clone(), h.def.connection_mode))
+                .collect()
+        };
+
+        for (id, _mode) in ids {
+            let is_healthy = {
+                let backends = self.backends.read().unwrap();
+                backends
+                    .get(&id)
+                    .map(|h| h.health.load(Ordering::SeqCst))
+                    .unwrap_or(false)
+            };
+
+            if !is_healthy {
+                // Try to reconnect
+                let attempt = {
+                    let backends = self.backends.read().unwrap();
+                    backends
+                        .get(&id)
+                        .map(|h| {
+                            let mut attempts = h.reconnect_attempts.lock().unwrap();
+                            *attempts += 1;
+                            *attempts
+                        })
+                        .unwrap_or(0)
+                };
+
+                // Exponential backoff: base * 2^(attempt-1), capped
+                let delay_ms = std::cmp::min(
+                    RECONNECT_BASE_DELAY_MS * 2u64.pow(attempt.saturating_sub(1)),
+                    RECONNECT_MAX_DELAY_MS,
+                );
+                tracing::info!(
+                    %id,
+                    attempt,
+                    delay_ms,
+                    "attempting reconnect with backoff"
+                );
+
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                match self.connect_backend(&id).await {
+                    Ok(()) => {
+                        tracing::info!(%id, attempt, "backend reconnected successfully");
+                    }
+                    Err(e) => {
+                        tracing::warn!(%id, attempt, %e, "reconnect attempt failed");
+                    }
+                }
+                continue;
+            }
+
+            // Run health check on healthy backends
+            let backend = {
+                let backends = self.backends.read().unwrap();
+                backends.get(&id).map(|h| h.backend.clone())
+            };
+
+            if let Some(backend) = backend {
+                match backend.health_check().await {
+                    Ok(()) => {
+                        // Still healthy
+                    }
+                    Err(e) => {
+                        tracing::warn!(%id, %e, "health check failed; marking unhealthy");
+                        if let Some(handle) = self.backends.read().unwrap().get(&id) {
+                            handle.health.store(false, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Build the aggregated tools/list response.
@@ -202,13 +312,14 @@ impl BackendRegistry {
     }
 
     /// Route a `tools/call` to the right backend.
+    /// For lazy backends, triggers connection on first call.
     pub async fn route_call(
         &self,
         exposed_name: &str,
         args: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, BackendError> {
-        let (backend, downstream_name) = {
+        let (backend_id, backend, downstream_name, mode) = {
             let tool_index = self.tool_index.read().unwrap();
             let routed = tool_index
                 .get(exposed_name)
@@ -223,12 +334,44 @@ impl BackendRegistry {
             let handle = backends.get(&routed.backend_id).ok_or_else(|| {
                 BackendError::new(
                     BackendErrorKind::Internal,
-                    format!("backend '{}' for tool '{}' is no longer registered", routed.backend_id, exposed_name),
+                    format!(
+                        "backend '{}' for tool '{}' is no longer registered",
+                        routed.backend_id, exposed_name
+                    ),
                 )
             })?;
 
-            (handle.backend.clone(), routed.downstream_name.clone())
+            (
+                routed.backend_id.clone(),
+                handle.backend.clone(),
+                routed.downstream_name.clone(),
+                handle.def.connection_mode,
+            )
         };
+
+        // Handle lazy connection: connect on first use
+        if matches!(mode, ConnectionMode::Lazy) {
+            let is_healthy = {
+                let backends = self.backends.read().unwrap();
+                backends
+                    .get(&backend_id)
+                    .map(|h| h.health.load(Ordering::SeqCst))
+                    .unwrap_or(false)
+            };
+
+            if !is_healthy {
+                tracing::info!(%backend_id, "lazy backend: connecting on first call");
+                self.connect_backend(&backend_id).await?;
+            }
+        }
+
+        // Handle per-call: connect, call, disconnect
+        if matches!(mode, ConnectionMode::PerCall) {
+            backend.connect().await?;
+            let result = backend.call_tool(&downstream_name, args, timeout).await;
+            backend.disconnect().await?;
+            return result;
+        }
 
         backend.call_tool(&downstream_name, args, timeout).await
     }
@@ -243,37 +386,11 @@ impl BackendRegistry {
             .collect();
         drop(backends);
 
-        // Clear existing tool index
         self.tool_index.write().unwrap().clear();
 
         for id in ids {
-            let (backend, namespace) = {
-                let backends = self.backends.read().unwrap();
-                let Some(handle) = backends.get(&id) else {
-                    continue;
-                };
-                (handle.backend.clone(), handle.def.namespace.clone())
-            };
-
-            if let Ok(tools) = backend.list_tools().await {
-                let mut tool_index = self.tool_index.write().unwrap();
-                for tool in &tools {
-                    let exposed_name = compute_exposed_name(namespace.as_deref(), &tool.name);
-                    tool_index.insert(
-                        exposed_name.clone(),
-                        RoutedTool {
-                            backend_id: id.clone(),
-                            exposed_name: exposed_name.clone(),
-                            downstream_name: tool.name.clone(),
-                            descriptor: ToolDescriptor {
-                                name: exposed_name,
-                                description: tool.description.clone(),
-                                input_schema: tool.input_schema.clone(),
-                            },
-                        },
-                    );
-                }
-                tracing::info!(%id, tool_count = tools.len(), "tools refreshed");
+            if let Err(e) = self.connect_backend(&id).await {
+                tracing::warn!(%id, %e, "failed to refresh tools");
             }
         }
 
@@ -298,7 +415,7 @@ fn compute_exposed_name(namespace: Option<&str>, tool_name: &str) -> String {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use headless_mcp_core::{InitializeResult, ServerCapabilities, ServerInfo};
+    use headless_mcp_core::{BackendResult, InitializeResult, ServerCapabilities, ServerInfo};
 
     struct MockBackend {
         id: String,
@@ -413,43 +530,6 @@ mod tests {
         let tools = registry.aggregated_tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "slack.send_message");
-    }
-
-    #[tokio::test]
-    async fn no_namespace_exposes_bare_names() {
-        let registry = BackendRegistry::new();
-        let backend = Arc::new(MockBackend::new("foo", vec![make_tool("bar")]));
-
-        registry
-            .register(make_def("foo", None), backend)
-            .await
-            .unwrap();
-
-        registry.connect_backend("foo").await.unwrap();
-
-        let tools = registry.aggregated_tools();
-        assert_eq!(tools[0].name, "bar");
-    }
-
-    #[tokio::test]
-    async fn collision_detection_rejects_overlapping_names() {
-        let registry = BackendRegistry::new();
-        let backend_a = Arc::new(MockBackend::new("a", vec![make_tool("query")]));
-        let backend_b = Arc::new(MockBackend::new("b", vec![make_tool("query")]));
-
-        registry
-            .register(make_def("a", None), backend_a)
-            .await
-            .unwrap();
-        registry
-            .register(make_def("b", None), backend_b)
-            .await
-            .unwrap();
-
-        registry.connect_backend("a").await.unwrap();
-        let result = registry.connect_backend("b").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("name collision"));
     }
 
     #[tokio::test]

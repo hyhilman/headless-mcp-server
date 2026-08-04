@@ -44,13 +44,8 @@ pub async fn run_one_shot(
     let mut found_backend: Option<(&BackendDef, String)> = None;
 
     for def in &hub_config.backends {
-        // Only stdio backends in Phase 1
-        if !matches!(&def.transport, BackendTransport::Stdio { .. }) {
-            continue;
-        }
-
         // If the tool has a namespace hint and it matches this backend's
-        // namespace, try it first (optimization, not correctness).
+        // namespace, try it first.
         let downstream_name = if let Some(ns) = &def.namespace {
             if let Some(hint) = namespace_hint {
                 if hint != ns {
@@ -143,7 +138,9 @@ fn connect_stdio_backend(def: &BackendDef) -> Result<Box<dyn McpBackend>, Box<dy
             )))
         }
         BackendTransport::Http { .. } => {
-            Err("HTTP backends are not yet implemented (Phase 2)".into())
+            Ok(Box::new(headless_mcp_backend_http::HttpBackend::new(
+                def.clone(),
+            )))
         }
     }
 }

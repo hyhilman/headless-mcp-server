@@ -12,7 +12,7 @@ pub mod types;
 pub use error::{BackendError, BackendErrorKind, BackendResult};
 pub use types::{
     BackendDef, BackendTransport, CallToolResult, ConnectionMode, ContentBlock, InitializeResult,
-    StderrMode, ToolDescriptor,
+    ServerCapabilities, ServerInfo, StderrMode, ToolDescriptor,
 };
 
 use async_trait::async_trait;

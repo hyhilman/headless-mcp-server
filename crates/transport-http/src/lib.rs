@@ -1,0 +1,60 @@
+#![forbid(unsafe_code)]
+
+//! HTTP+SSE MCP transport.
+//!
+//! Wraps `headless_mcp_server::McpSession` behind an authenticated
+//! network listener. Every request passes a per-IP rate limit and a
+//! constant-time bearer-token check before reaching the session.
+
+mod auth;
+mod handlers;
+mod rate_limit;
+mod router;
+mod state;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use headless_mcp_server::McpSession;
+
+/// Configuration for [`run_http`].
+pub struct HttpTransportConfig {
+    pub bind_addr: SocketAddr,
+    pub bearer_token: String,
+    pub rate_limit_per_minute: u32,
+}
+
+impl std::fmt::Debug for HttpTransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpTransportConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("bearer_token", &"<redacted>")
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .finish()
+    }
+}
+
+/// Runs the HTTP+SSE MCP transport until the listener exits.
+pub async fn run_http(
+    session: Arc<McpSession>,
+    config: HttpTransportConfig,
+) -> Result<(), std::io::Error> {
+    if !config.bind_addr.ip().is_loopback() {
+        tracing::warn!(
+            addr = %config.bind_addr,
+            "http transport bound to a non-loopback address; the MCP server is reachable beyond localhost"
+        );
+    }
+
+    tracing::info!(addr = %config.bind_addr, "http transport listening");
+
+    let app = router::build_router(session, &config);
+
+    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+}

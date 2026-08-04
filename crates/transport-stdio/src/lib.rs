@@ -84,8 +84,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use headless_mcp_server::{McpSession, TracingAuditLogger};
     use headless_mcp_registry::BackendRegistry;
+    use headless_mcp_server::{McpSession, TracingAuditLogger};
     use serde_json::{json, Value};
     use tokio::io::AsyncReadExt;
 

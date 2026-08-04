@@ -1,0 +1,18 @@
+[package]
+name = "headless-mcp-backend-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP-based MCP backend: connect to remote MCP servers over HTTP+SSE."
+
+[dependencies]
+headless-mcp-core = { path = "../../core" }
+headless-mcp-wire = { path = "../../mcp-wire" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true

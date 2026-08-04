@@ -17,7 +17,9 @@ headless-mcp-registry = { path = "../registry" }
 headless-mcp-wire = { path = "../mcp-wire" }
 headless-mcp-server = { path = "../mcp-server" }
 headless-mcp-transport-stdio = { path = "../transport-stdio" }
+headless-mcp-transport-http = { path = "../transport-http" }
 headless-mcp-backend-stdio = { path = "../backends/backend-stdio" }
+headless-mcp-backend-http = { path = "../backends/backend-http" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

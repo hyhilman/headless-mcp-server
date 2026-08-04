@@ -1,18 +1,19 @@
 [package]
-name = "headless-mcp-transport-stdio"
+name = "headless-mcp-transport-http"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Newline-delimited JSON-RPC over stdio for local MCP use."
+description = "HTTP+SSE MCP transport with bearer-token auth and rate limiting."
 
 [dependencies]
 headless-mcp-wire = { path = "../mcp-wire" }
 headless-mcp-server = { path = "../mcp-server" }
-headless-mcp-registry = { path = "../registry" }
+axum.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-async-trait.workspace = true
+thiserror.workspace = true
+governor.workspace = true
+subtle.workspace = true
