@@ -1,0 +1,16 @@
+services:
+  headless-mcp:
+    build: .
+    ports:
+      - "127.0.0.1:9797:9797"
+    environment:
+      HEADLESS_MCP_TOKEN: "${HEADLESS_MCP_TOKEN:?set HEADLESS_MCP_TOKEN in .env}"
+      HEADLESS_MCP_MASTER_KEY: "${HEADLESS_MCP_MASTER_KEY:-}"
+      RUST_LOG: "info"
+    volumes:
+      - headless-mcp-data:/data
+      - ./headless-mcp.toml:/home/headless-mcp/.config/headless-mcp/config.toml:ro
+    restart: unless-stopped
+
+volumes:
+  headless-mcp-data:

@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      created: ${{ steps.tag.outputs.created }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Tag if version changed
+        id: tag
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/version = "(.+)"/\1/')
+          if [ -z "$version" ]; then
+            echo "could not determine workspace version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          tag="v$version"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists; nothing to release."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "$tag"
+          git push origin "$tag"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+  docker:
+    needs: tag
+    if: needs.tag.outputs.created == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-image.yml
+    with:
+      ref: v${{ needs.tag.outputs.version }}
+      version: v${{ needs.tag.outputs.version }}

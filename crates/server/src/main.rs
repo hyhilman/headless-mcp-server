@@ -87,6 +87,11 @@ enum Commands {
     },
     /// Print the resolved config
     Config,
+    /// One-time OAuth2 authorization for a specific backend
+    Auth {
+        /// Backend id to authenticate (omit to list available)
+        backend: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -146,6 +151,12 @@ async fn main() -> ExitCode {
         }
         Some(Commands::Config) => {
             run_print_config(config_path);
+        }
+        Some(Commands::Auth { backend }) => {
+            if let Err(e) = run_auth(config_path, backend).await {
+                tracing::error!(%e, "auth failed");
+                return ExitCode::FAILURE;
+            }
         }
         None if cli.dry_run => {
             if let Err(e) = run_dry_run(config_path).await {
@@ -322,7 +333,11 @@ async fn build_registry(
                 Arc::new(headless_mcp_backend_stdio::StdioBackend::new(def.clone()))
             }
             BackendTransport::Http { .. } => {
-                Arc::new(headless_mcp_backend_http::HttpBackend::new(def.clone()))
+                Arc::new(headless_mcp_backend_http::HttpBackend::with_store(
+                    def.clone(),
+                    None,
+                    true, // daemon mode — don't block on OAuth2
+                ))
             }
         };
 
@@ -330,4 +345,121 @@ async fn build_registry(
     }
 
     Ok(registry)
+}
+
+/// One-time OAuth2 authorization. If `target` is provided, only auth that backend.
+/// Otherwise, list all backends that need OAuth2 auth and let the user pick.
+async fn run_auth(config_path: Option<&str>, target: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    use headless_mcp_backend_http::token_store;
+    use headless_mcp_secrets::EncryptedFileSecretStore;
+
+    let hub_config = load_config(config_path)?;
+
+    // Collect backends that have OAuth2 config
+    let oauth2_backends: Vec<_> = hub_config
+        .backends
+        .iter()
+        .filter(|def| {
+            matches!(&def.transport, BackendTransport::Http {
+                oauth2: Some(_), ..
+            })
+        })
+        .collect();
+
+    if oauth2_backends.is_empty() {
+        println!("No backends configured with OAuth2.");
+        println!("Add [backends.<id>.oauth2] section to your config.");
+        return Ok(());
+    }
+
+    // If no specific backend specified, list them
+    let target_id = match target {
+        Some(id) => id,
+        None => {
+            println!("Backends with OAuth2:");
+            for (i, def) in oauth2_backends.iter().enumerate() {
+                let ns = def.namespace.as_deref().unwrap_or("<none>");
+                println!("  [{}] {}  →  namespace: {}", i + 1, def.id, ns);
+            }
+            println!("\nRun 'headless-mcp auth <backend-id>' to authenticate one.");
+            println!("Or 'headless-mcp auth --all' to authenticate all.");
+            return Ok(());
+        }
+    };
+
+    if target_id == "--all" {
+        // Auth all backends one by one
+        for def in &oauth2_backends {
+            auth_one_backend(def, config_path).await?;
+        }
+    } else {
+        // Auth a specific backend
+        let def = oauth2_backends
+            .iter()
+            .find(|d| d.id == target_id)
+            .ok_or_else(|| format!("No OAuth2 backend with id '{}'. Use 'headless-mcp auth' to list.", target_id))?;
+        auth_one_backend(def, config_path).await?;
+    }
+
+    Ok(())
+}
+
+async fn auth_one_backend(
+    def: &headless_mcp_core::BackendDef,
+    _config_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use headless_mcp_backend_http::token_store;
+    use headless_mcp_secrets::EncryptedFileSecretStore;
+
+    println!("\n═══ Authenticating '{}' ═══", def.id);
+
+    // Initialize secrets store for token persistence
+    let data_dir = std::env::var("HEADLESS_MCP_DATA_DIR").unwrap_or_else(|_| ".".to_string());
+    let secrets_path = std::path::Path::new(&data_dir).join("secrets.json");
+    let token_store = match EncryptedFileSecretStore::from_env(secrets_path) {
+        Ok(store) => {
+            tracing::debug!("token store ready");
+            Some(std::sync::Arc::new(store))
+        }
+        Err(headless_mcp_secrets::SecretError::MissingMasterKey) => {
+            tracing::warn!("HEADLESS_MCP_MASTER_KEY not set — token won't persist");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(%e, "token store init failed");
+            None
+        }
+    };
+
+    let backend = headless_mcp_backend_http::HttpBackend::with_store(
+        def.clone(),
+        token_store.clone(),
+        false,
+    );
+    let backend: std::sync::Arc<dyn headless_mcp_core::McpBackend> = std::sync::Arc::new(backend);
+
+    match backend.connect().await {
+        Ok(init) => {
+            println!("✅ Connected to {} ({})", def.id, init.server_info.name);
+            match backend.list_tools().await {
+                Ok(tools) => {
+                    println!("   {} tools:", tools.len());
+                    for t in &tools {
+                        println!("   • {}.{}", def.namespace.as_deref().unwrap_or(""), t.name);
+                    }
+                }
+                Err(e) => tracing::warn!(%e, "couldn't list tools (backend may still work)"),
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ {}: {}", def.id, e);
+            eprintln!("   Tip: add 'bearer_token' to your config for static token auth instead.");
+        }
+    }
+
+    if token_store.is_some() {
+        println!("   Token persisted — won't ask again.");
+    }
+
+    Ok(())
 }

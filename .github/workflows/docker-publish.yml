@@ -1,0 +1,16 @@
+name: Docker Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-image.yml
+    with:
+      ref: ${{ github.ref }}
+      version: ${{ github.ref_name }}
