@@ -8,7 +8,7 @@
 //! the right backend.
 
 use headless_mcp_core::{
-    BackendDef, BackendError, BackendErrorKind, BackendResult, ConnectionMode, McpBackend,
+    BackendDef, BackendError, BackendErrorKind, ConnectionMode, McpBackend,
     ToolDescriptor,
 };
 use serde_json::Value;

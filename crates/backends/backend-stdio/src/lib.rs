@@ -10,7 +10,7 @@ mod stderr_capture;
 
 use async_trait::async_trait;
 use headless_mcp_core::{
-    BackendDef, BackendError, BackendErrorKind, BackendResult, InitializeResult, McpBackend, StderrMode,
+    BackendDef, BackendError, BackendErrorKind, BackendResult, InitializeResult, McpBackend,
     ToolDescriptor,
 };
 use headless_mcp_wire::{
@@ -18,14 +18,12 @@ use headless_mcp_wire::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
-};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::oneshot;
+use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::sync::{Mutex, oneshot};
 
 use stderr_capture::StderrCapture;
 
@@ -102,8 +100,8 @@ impl StdioBackend {
         })?;
         serialized.push(b'\n');
 
-        let _guard = self.write_guard.lock().unwrap();
-        let mut stdin_guard = self.state.stdin.lock().unwrap();
+        let _guard = self.write_guard.lock().await;
+        let mut stdin_guard = self.state.stdin.lock().await;
         let stdin = stdin_guard
             .as_mut()
             .ok_or_else(|| BackendError::new(BackendErrorKind::Connection, "stdin not available"))?;
@@ -124,13 +122,13 @@ impl StdioBackend {
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, BackendError> {
-        let id = self.request_counter.fetch_add(1, Ordering::SeqCst);
+        let id = self.request_counter.fetch_add(1, Ordering::SeqCst) as i64;
         let request =
             JsonRpcMessage::Request(JsonRpcRequest::new(JsonRpcId::Number(id), method, params));
 
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.state.pending.lock().unwrap();
+            let mut pending = self.state.pending.lock().await;
             pending.insert(id, tx);
         }
 
@@ -139,8 +137,11 @@ impl StdioBackend {
         tokio::time::timeout(timeout, rx)
             .await
             .map_err(|_| {
-                let mut pending = self.state.pending.lock().unwrap();
-                pending.remove(&id);
+                // Best effort cleanup — if the lock is held we just let
+                // the response reader task clean up when the backend disconnects.
+                if let Ok(mut pending) = self.state.pending.try_lock() {
+                    pending.remove(&id);
+                }
                 BackendError::new(
                     BackendErrorKind::Timeout,
                     format!(
@@ -179,7 +180,7 @@ impl McpBackend for StdioBackend {
                 .state
                 .initialize_result
                 .lock()
-                .unwrap()
+                .await
                 .clone()
                 .ok_or_else(|| {
                     BackendError::new(
@@ -215,7 +216,7 @@ impl McpBackend for StdioBackend {
 
         // Store stdin
         {
-            let mut stdin_guard = self.state.stdin.lock().unwrap();
+            let mut stdin_guard = self.state.stdin.lock().await;
             *stdin_guard = Some(stdin);
         }
 
@@ -229,7 +230,7 @@ impl McpBackend for StdioBackend {
             // Mark as disconnected when the reader exits
             state.connected.store(false, Ordering::SeqCst);
             // Notify all pending callers
-            let mut pending = state.pending.lock().unwrap();
+            let mut pending = state.pending.lock().await;
             for (_, tx) in pending.drain() {
                 let _ = tx.send(Err(BackendError::new(
                     BackendErrorKind::Connection,
@@ -283,7 +284,7 @@ impl McpBackend for StdioBackend {
         self.send_message(&notification).await?;
 
         // Store results
-        *self.state.initialize_result.lock().unwrap() = Some(init_result.clone());
+        *self.state.initialize_result.lock().await = Some(init_result.clone());
         self.state.connected.store(true, Ordering::SeqCst);
 
         tracing::info!(
@@ -364,7 +365,7 @@ impl McpBackend for StdioBackend {
         self.state.connected.store(false, Ordering::SeqCst);
         // Drop stdin to signal EOF to the child
         {
-            let mut stdin_guard = self.state.stdin.lock().unwrap();
+            let mut stdin_guard = self.state.stdin.lock().await;
             *stdin_guard = None;
         }
         tracing::info!(backend_id = %self.def.id, "stdio backend disconnected");
@@ -428,7 +429,7 @@ async fn read_responses(
                     JsonRpcId::Number(n) => *n,
                     _ => continue,
                 };
-                let mut pending = state.pending.lock().unwrap();
+                let mut pending = state.pending.lock().await;
                 if let Some(tx) = pending.remove(&id) {
                     let _ = tx.send(Ok(resp.result));
                 }
@@ -438,7 +439,7 @@ async fn read_responses(
                     Some(JsonRpcId::Number(n)) => *n,
                     _ => continue,
                 };
-                let mut pending = state.pending.lock().unwrap();
+                let mut pending = state.pending.lock().await;
                 if let Some(tx) = pending.remove(&id) {
                     let _ = tx.send(Err(BackendError::new(
                         BackendErrorKind::Protocol,
@@ -449,9 +450,7 @@ async fn read_responses(
                     )));
                 }
             }
-            _ => {
-                // Notifications or unexpected messages from the backend are ignored
-            }
+            _ => {}
         }
     }
 }

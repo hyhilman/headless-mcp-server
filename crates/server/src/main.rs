@@ -100,9 +100,11 @@ async fn main() -> ExitCode {
         .with_env_filter(env_filter)
         .init();
 
+    let config_path = cli.config.as_deref();
+
     match cli.command {
         Some(Commands::Serve { http, .. }) => {
-            if let Err(e) = run_serve(http).await {
+            if let Err(e) = run_serve(http, config_path).await {
                 tracing::error!(%e, "server exited with error");
                 return ExitCode::FAILURE;
             }
@@ -113,29 +115,29 @@ async fn main() -> ExitCode {
             json,
             format,
         }) => {
-            if let Err(e) = run_one_shot(&tool, &args, json.as_deref(), &format).await {
+            if let Err(e) = run_one_shot(&tool, &args, json.as_deref(), &format, config_path).await {
                 tracing::error!(%e, "call failed");
                 return ExitCode::FAILURE;
             }
         }
         Some(Commands::Tools { server: _server }) => {
-            if let Err(e) = run_list_tools().await {
+            if let Err(e) = run_list_tools(config_path).await {
                 tracing::error!(%e, "tools list failed");
                 return ExitCode::FAILURE;
             }
         }
         Some(Commands::Config) => {
-            run_print_config();
+            run_print_config(config_path);
         }
         None if cli.dry_run => {
-            if let Err(e) = run_dry_run().await {
+            if let Err(e) = run_dry_run(config_path).await {
                 tracing::error!(%e, "dry-run failed");
                 return ExitCode::FAILURE;
             }
         }
         None => {
             // Default: serve via stdio
-            if let Err(e) = run_serve(false).await {
+            if let Err(e) = run_serve(false, config_path).await {
                 tracing::error!(%e, "server exited with error");
                 return ExitCode::FAILURE;
             }
@@ -145,8 +147,8 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn run_serve(_http: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let hub_config = load_config()?;
+async fn run_serve(_http: bool, config_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let hub_config = load_config(config_path)?;
 
     let registry = Arc::new(BackendRegistry::new());
 
@@ -186,9 +188,18 @@ async fn run_serve(_http: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_list_tools() -> Result<(), Box<dyn std::error::Error>> {
-    let hub_config = load_config()?;
+async fn run_list_tools(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let hub_config = load_config(config_path)?;
     let registry = build_registry(&hub_config).await?;
+
+    // Connect all eager backends so we can see their tools
+    let results = registry.connect_all().await;
+    for (id, result) in &results {
+        match result {
+            Ok(()) => tracing::info!(backend_id = %id, "connected"),
+            Err(e) => tracing::warn!(backend_id = %id, error = %e, "failed to connect"),
+        }
+    }
 
     let tools = registry.aggregated_tools();
     if tools.is_empty() {
@@ -203,10 +214,10 @@ async fn run_list_tools() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_dry_run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_dry_run(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("dry-run: loading config and connecting eager backends...");
 
-    let hub_config = load_config()?;
+    let hub_config = load_config(config_path)?;
     tracing::info!("config loaded with {} backends", hub_config.backends.len());
 
     let registry = build_registry(&hub_config).await?;
@@ -236,8 +247,8 @@ async fn run_dry_run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_print_config() {
-    match load_config() {
+fn run_print_config(config_path: Option<&str>) {
+    match load_config(config_path) {
         Ok(hub_config) => {
             println!("Backends ({})", hub_config.backends.len());
             for def in &hub_config.backends {

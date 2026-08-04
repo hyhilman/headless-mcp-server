@@ -121,8 +121,8 @@ fn dirs() -> Option<PathBuf> {
 }
 
 /// Load and resolve the hub config.
-pub fn load_config() -> Result<HubConfig, Box<dyn std::error::Error>> {
-    let config_path = find_config_file(None).ok_or_else(|| {
+pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::error::Error>> {
+    let config_path = find_config_file(explicit).ok_or_else(|| {
         "no config file found. Create one at ./headless-mcp.toml or ~/.config/headless-mcp/config.toml"
     })?;
 

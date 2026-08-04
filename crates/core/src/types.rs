@@ -94,6 +94,7 @@ pub enum StderrMode {
 
 /// Result of a successful MCP initialize handshake with a backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
     pub protocol_version: String,
     pub server_info: ServerInfo,
@@ -101,12 +102,14 @@ pub struct InitializeResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
     pub name: String,
     pub version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerCapabilities {
     #[serde(default)]
     pub tools: Option<ToolsCapability>,
@@ -117,12 +120,14 @@ pub struct ServerCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolsCapability {
     #[serde(default = "default_true")]
     pub list_changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResourcesCapability {
     #[serde(default = "default_true")]
     pub subscribe: bool,
@@ -131,6 +136,7 @@ pub struct ResourcesCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptsCapability {
     #[serde(default = "default_true")]
     pub list_changed: bool,
@@ -142,6 +148,7 @@ fn default_true() -> bool {
 
 /// Describes a tool for the `tools/list` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolDescriptor {
     pub name: String,
     pub description: String,

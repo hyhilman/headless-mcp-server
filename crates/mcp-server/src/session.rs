@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use headless_mcp_core::ContentBlock;
 use headless_mcp_registry::BackendRegistry;
 use headless_mcp_wire::{
     JsonRpcError, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,

@@ -11,19 +11,13 @@ pub async fn run_one_shot(
     args: &[String],
     json_args: Option<&str>,
     format: &str,
+    config_path: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let hub_config = load_config()?;
+    let hub_config = load_config(config_path)?;
 
-    // Parse a dot-separated tool name to find the backend
-    // e.g. "slack.send_message" → backend "slack", tool "send_message"
-    let (backend_id, downstream_name) = parse_tool_name(tool_name);
-
-    // Find the backend definition
-    let def = hub_config
-        .backends
-        .iter()
-        .find(|d| d.id == backend_id)
-        .ok_or_else(|| format!("no backend configured with id '{backend_id}'"))?;
+    // Parse a dot-separated tool name to guess the backend
+    // e.g. "slack.send_message" → backend could be "slack" if namespace matches
+    let (namespace_hint, _downstream_name) = parse_tool_name(tool_name);
 
     // Parse arguments
     let arguments = if let Some(json_str) = json_args {
@@ -44,14 +38,70 @@ pub async fn run_one_shot(
         None
     };
 
-    // Connect to the backend
-    let backend = connect_to_backend(def, backend_id.as_str())?;
+    // Search all stdio backends for the tool.
+    // First, try backends whose namespace matches the tool prefix.
+    // Then fall back to trying all backends.
+    let mut found_backend: Option<(&BackendDef, String)> = None;
+
+    for def in &hub_config.backends {
+        // Only stdio backends in Phase 1
+        if !matches!(&def.transport, BackendTransport::Stdio { .. }) {
+            continue;
+        }
+
+        // If the tool has a namespace hint and it matches this backend's
+        // namespace, try it first (optimization, not correctness).
+        let downstream_name = if let Some(ns) = &def.namespace {
+            if let Some(hint) = namespace_hint {
+                if hint != ns {
+                    // Namespace hint doesn't match — this backend probably
+                    // doesn't own this tool, skip for now
+                    continue;
+                }
+            }
+            // Strip the namespace prefix to get the downstream tool name
+            match tool_name.strip_prefix(&format!("{ns}.")) {
+                Some(name) => name.to_string(),
+                None => continue,
+            }
+        } else {
+            // No namespace — tool name is bare
+            tool_name.to_string()
+        };
+
+        // Connect, check if the tool exists, call it
+        let backend = connect_stdio_backend(def)?;
+        if let Err(e) = backend.connect().await {
+            tracing::warn!(backend_id = %def.id, %e, "failed to connect for one-shot; skipping");
+            continue;
+        }
+
+        // Quick check: list tools and see if ours is there
+        match backend.list_tools().await {
+            Ok(tools) => {
+                if tools.iter().any(|t| t.name == downstream_name) {
+                    found_backend = Some((def, downstream_name));
+                    // We'll keep this connection and use it below
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(backend_id = %def.id, %e, "failed to list tools; skipping");
+            }
+        }
+        let _ = backend.disconnect().await;
+    }
+
+    let (def, downstream_name) = found_backend
+        .ok_or_else(|| format!("no backend found that owns tool '{tool_name}'"))?;
+
+    // Connect and call
+    let backend = connect_stdio_backend(def)?;
     backend.connect().await?;
 
-    // Call the tool
     let timeout = Duration::from_secs(def.call_timeout_secs);
     let result = backend
-        .call_tool(downstream_name.as_str(), arguments, timeout)
+        .call_tool(&downstream_name, arguments, timeout)
         .await
         .map_err(|e| format!("tool call failed: {e}"))?;
 
@@ -66,7 +116,6 @@ pub async fn run_one_shot(
             print_table(&result)?;
         }
         _ => {
-            // pretty: same as json for now
             let json_str =
                 serde_json::to_string_pretty(&result).map_err(|e| format!("serialize: {e}"))?;
             println!("{json_str}");
@@ -77,35 +126,25 @@ pub async fn run_one_shot(
     Ok(())
 }
 
-/// Parse "slack.send_message" → ("slack", "send_message")
-fn parse_tool_name(tool_name: &str) -> (String, String) {
+/// Parse "slack.send_message" → (Some("slack"), "send_message")
+/// Parse "bare_tool" → (None, "bare_tool")
+fn parse_tool_name(tool_name: &str) -> (Option<&str>, &str) {
     match tool_name.split_once('.') {
-        Some((backend, tool)) => (backend.to_string(), tool.to_string()),
-        None => {
-            // No dot: assume the tool name IS the exposed name without namespace
-            // This means we need to search all backends.
-            // For now, just use the whole string as both
-            (tool_name.to_string(), tool_name.to_string())
-        }
+        Some((prefix, rest)) => (Some(prefix), rest),
+        None => (None, tool_name),
     }
 }
 
-/// A lightweight one-shot stdio backend that connects just for a single call.
-/// This uses the same StdioBackend from backend-stdio but wraps it for
-/// one-shot use.
-fn connect_to_backend(
-    def: &BackendDef,
-    backend_id: &str,
-) -> Result<Box<dyn McpBackend>, Box<dyn std::error::Error>> {
+fn connect_stdio_backend(def: &BackendDef) -> Result<Box<dyn McpBackend>, Box<dyn std::error::Error>> {
     match &def.transport {
         BackendTransport::Stdio { .. } => {
             Ok(Box::new(headless_mcp_backend_stdio::StdioBackend::new(
                 def.clone(),
             )))
         }
-        BackendTransport::Http { .. } => Err(
-            "HTTP backends are not yet implemented (Phase 2)".into(),
-        ),
+        BackendTransport::Http { .. } => {
+            Err("HTTP backends are not yet implemented (Phase 2)".into())
+        }
     }
 }
 
@@ -116,11 +155,9 @@ fn print_table(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
                 println!("(empty)");
                 return Ok(());
             }
-            // Extract keys from the first row
             if let Some(first) = rows.first() {
                 if let Some(obj) = first.as_object() {
                     let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
-                    // Print header
                     let header = keys
                         .iter()
                         .map(|k| format!("{:<20}", k))
@@ -129,7 +166,6 @@ fn print_table(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
                     println!("{header}");
                     println!("{}", "-".repeat(header.len()));
 
-                    // Print rows
                     for row in rows {
                         let vals: Vec<String> = keys
                             .iter()
