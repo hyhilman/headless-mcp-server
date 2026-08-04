@@ -1,90 +1,192 @@
 //! OAuth2 token management for HTTP backends.
 //!
 //! Supports:
+//! - MCP OAuth2 automated discovery from 401 WWW-Authenticate headers
 //! - Client credentials grant (machine-to-machine)
-//! - MCP OAuth2 discovery from 401 WWW-Authenticate headers
+//! - Authorization code + PKCE grant (interactive, with local callback server)
 //! - Automatic token refresh
 
-use headless_mcp_core::{OAuth2Config, BackendError, BackendErrorKind};
+use headless_mcp_core::{BackendError, BackendErrorKind, OAuth2Config};
 use serde::Deserialize;
-use std::sync::Mutex;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
-use tracing;
+use tokio::sync::Mutex;
 
-/// OAuth2 discovery metadata from the MCP server's WWW-Authenticate header.
+/// OAuth2 protected resource metadata (RFC 9728 / MCP spec).
 #[derive(Debug, Clone, Deserialize)]
-pub struct OAuth2Metadata {
-    pub issuer: Option<String>,
-    pub token_endpoint: String,
-    pub authorization_endpoint: Option<String>,
-    pub registration_endpoint: Option<String>,
+pub struct ResourceMetadata {
+    pub resource: String,
+    pub authorization_servers: Option<Vec<String>>,
     pub scopes_supported: Option<Vec<String>>,
-    pub grant_types_supported: Option<Vec<String>>,
+    pub bearer_methods_supported: Option<Vec<String>>,
+    pub resource_name: Option<String>,
 }
 
-/// A cached OAuth2 access token with expiry.
+/// OAuth2 authorization server metadata (RFC 8414).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthServerMetadata {
+    pub issuer: String,
+    pub authorization_endpoint: Option<String>,
+    pub token_endpoint: String,
+    pub registration_endpoint: Option<String>,
+    pub scopes_supported: Option<Vec<String>>,
+    pub response_types_supported: Option<Vec<String>>,
+    pub grant_types_supported: Option<Vec<String>>,
+    pub code_challenge_methods_supported: Option<Vec<String>>,
+    pub token_endpoint_auth_methods_supported: Option<Vec<String>>,
+}
+
+/// The fully discovered OAuth2 metadata for a backend.
+#[derive(Debug, Clone)]
+pub struct DiscoveredOAuth2 {
+    pub resource_metadata: ResourceMetadata,
+    pub auth_server_metadata: AuthServerMetadata,
+}
+
+/// A cached OAuth2 access token with refresh capability.
 #[derive(Debug, Clone)]
 struct TokenCache {
     access_token: String,
+    refresh_token: Option<String>,
     expires_at: Instant,
 }
 
 /// Manages OAuth2 token lifecycle for an HTTP backend.
 pub struct OAuth2TokenManager {
     config: OAuth2Config,
-    /// Cached token, if we've already obtained one.
+    /// Cached token.
     token_cache: Mutex<Option<TokenCache>>,
-    /// Metadata discovered from 401 responses.
-    metadata: Mutex<Option<OAuth2Metadata>>,
+    /// Discovered metadata from 401 responses.
+    discovered: StdMutex<Option<DiscoveredOAuth2>>,
     /// HTTP client for token requests.
     client: reqwest::Client,
 }
 
 impl OAuth2TokenManager {
-    /// Create a new token manager from OAuth2 config.
     pub fn new(config: OAuth2Config) -> Self {
         Self {
             config,
             token_cache: Mutex::new(None),
-            metadata: Mutex::new(None),
+            discovered: StdMutex::new(None),
             client: reqwest::Client::new(),
         }
     }
 
-    /// Store discovered OAuth2 metadata from a WWW-Authenticate header.
-    pub fn set_metadata(&self, metadata: OAuth2Metadata) {
+    /// Run the full OAuth2 discovery flow from a resource_metadata URL.
+    pub async fn discover(
+        &self,
+        resource_metadata_url: &str,
+        backend_id: &str,
+    ) -> Result<DiscoveredOAuth2, BackendError> {
+        tracing::info!(%backend_id, %resource_metadata_url, "fetching OAuth2 resource metadata");
+
+        // Step 1: fetch resource metadata
+        let resource_metadata: ResourceMetadata = self
+            .client
+            .get(resource_metadata_url)
+            .send()
+            .await
+            .map_err(|e| BackendError::new(
+                BackendErrorKind::Auth,
+                format!("failed to fetch resource metadata: {e}"),
+            ))?
+            .json()
+            .await
+            .map_err(|e| BackendError::new(
+                BackendErrorKind::Auth,
+                format!("failed to parse resource metadata: {e}"),
+            ))?;
+
         tracing::info!(
-            token_endpoint = %metadata.token_endpoint,
-            "OAuth2 metadata discovered"
+            %backend_id,
+            resource = %resource_metadata.resource,
+            "resource metadata fetched"
         );
-        *self.metadata.lock().unwrap() = Some(metadata);
+
+        // Step 2: fetch authorization server metadata
+        let auth_server_url = resource_metadata
+            .authorization_servers
+            .as_ref()
+            .and_then(|servers| servers.first())
+            .map(|url| format!("{url}/.well-known/oauth-authorization-server"))
+            .ok_or_else(|| BackendError::new(
+                BackendErrorKind::Auth,
+                "resource metadata has no authorization_servers",
+            ))?;
+
+        tracing::info!(%backend_id, %auth_server_url, "fetching authorization server metadata");
+
+        let auth_server_metadata: AuthServerMetadata = self
+            .client
+            .get(&auth_server_url)
+            .send()
+            .await
+            .map_err(|e| BackendError::new(
+                BackendErrorKind::Auth,
+                format!("failed to fetch auth server metadata: {e}"),
+            ))?
+            .json()
+            .await
+            .map_err(|e| BackendError::new(
+                BackendErrorKind::Auth,
+                format!("failed to parse auth server metadata: {e}"),
+            ))?;
+
+        tracing::info!(
+            %backend_id,
+            issuer = %auth_server_metadata.issuer,
+            token_endpoint = %auth_server_metadata.token_endpoint,
+            grants = ?auth_server_metadata.grant_types_supported,
+            "authorization server metadata fetched"
+        );
+
+        let discovered = DiscoveredOAuth2 {
+            resource_metadata,
+            auth_server_metadata,
+        };
+        *self.discovered.lock().unwrap() = Some(discovered.clone());
+        Ok(discovered)
     }
 
-    /// Get a valid access token. If we have a cached non-expired token, return it.
-    /// Otherwise, run the token acquisition flow.
+    /// Get a valid access token. Runs discovery, acquires token, caches it.
     pub async fn get_token(&self, backend_id: &str) -> Result<String, BackendError> {
         // Check cache first
         {
-            let cache = self.token_cache.lock().unwrap();
+            let cache = self.token_cache.lock().await;
             if let Some(cached) = cache.as_ref() {
                 if cached.expires_at > Instant::now() + Duration::from_secs(30) {
                     tracing::debug!(%backend_id, "using cached OAuth2 token");
                     return Ok(cached.access_token.clone());
                 }
+
+                // Try refresh if we have a refresh token
+                if let Some(refresh_token) = &cached.refresh_token {
+                    tracing::debug!(%backend_id, "attempting token refresh");
+                    match self.do_refresh(refresh_token, backend_id).await {
+                        Ok(new_token) => return Ok(new_token),
+                        Err(e) => tracing::warn!(%e, "token refresh failed, will re-acquire"),
+                    }
+                }
             }
         }
 
         // Need a new token
-        tracing::info!(%backend_id, grant_type = %self.config.grant_type, "acquiring OAuth2 token");
-
         let token_endpoint = self.resolve_token_endpoint()?;
+        let grant_type = self.resolve_grant_type()?;
 
-        match self.config.grant_type.as_str() {
-            "client_credentials" => self.do_client_credentials(&token_endpoint, backend_id).await,
+        tracing::info!(%backend_id, %grant_type, %token_endpoint, "acquiring OAuth2 token");
+
+        match grant_type.as_str() {
+            "client_credentials" => {
+                self.do_client_credentials(&token_endpoint, backend_id).await
+            }
             "authorization_code" => {
+                self.do_authorization_code(&token_endpoint, backend_id).await
+            }
+            "urn:ietf:params:oauth:grant-type:jwt-bearer" => {
                 Err(BackendError::new(
                     BackendErrorKind::Auth,
-                    "authorization_code grant requires interactive flow; use client_credentials for headless operation",
+                    "JWT bearer grant is not yet supported by headless-mcp",
                 ))
             }
             other => Err(BackendError::new(
@@ -95,23 +197,27 @@ impl OAuth2TokenManager {
     }
 
     fn resolve_token_endpoint(&self) -> Result<String, BackendError> {
-        // Prefer configured token endpoint
         if let Some(ref endpoint) = self.config.token_endpoint {
             if !endpoint.is_empty() {
                 return Ok(endpoint.clone());
             }
         }
-
-        // Fall back to discovered metadata
-        let metadata = self.metadata.lock().unwrap();
-        if let Some(ref meta) = *metadata {
-            return Ok(meta.token_endpoint.clone());
+        if let Some(ref disc) = *self.discovered.lock().unwrap() {
+            return Ok(disc.auth_server_metadata.token_endpoint.clone());
         }
-
         Err(BackendError::new(
             BackendErrorKind::Auth,
             "no OAuth2 token endpoint configured or discovered",
         ))
+    }
+
+    fn resolve_grant_type(&self) -> Result<String, BackendError> {
+        if !self.config.grant_type.is_empty()
+            && self.config.grant_type != "client_credentials"
+        {
+            return Ok(self.config.grant_type.clone());
+        }
+        Ok("client_credentials".to_string())
     }
 
     async fn do_client_credentials(
@@ -122,14 +228,12 @@ impl OAuth2TokenManager {
         let client_id = self.config.client_id.as_deref().ok_or_else(|| {
             BackendError::new(BackendErrorKind::Auth, "OAuth2 client_id not configured")
         })?;
-
         let client_secret = self.config.client_secret.as_deref().ok_or_else(|| {
             BackendError::new(BackendErrorKind::Auth, "OAuth2 client_secret not configured")
         })?;
-
         let scopes = self.config.scopes.as_deref().unwrap_or("mcp");
 
-        tracing::debug!(%backend_id, %token_endpoint, %client_id, %scopes, "running client_credentials grant");
+        tracing::debug!(%backend_id, %token_endpoint, %client_id, "running client_credentials grant");
 
         let response = self
             .client
@@ -142,18 +246,16 @@ impl OAuth2TokenManager {
             ])
             .send()
             .await
-            .map_err(|e| {
-                BackendError::new(
-                    BackendErrorKind::Auth,
-                    format!("OAuth2 token request failed: {e}"),
-                )
-            })?;
+            .map_err(|e| BackendError::new(
+                BackendErrorKind::Auth,
+                format!("OAuth2 token request failed: {e}"),
+            ))?;
 
         let status = response.status();
         let body: serde_json::Value = response.json().await.map_err(|e| {
             BackendError::new(
                 BackendErrorKind::Auth,
-                format!("failed to parse OAuth2 token response: {e}"),
+                format!("failed to parse token response: {e}"),
             )
         })?;
 
@@ -164,68 +266,295 @@ impl OAuth2TokenManager {
                 .unwrap_or("unknown error");
             return Err(BackendError::new(
                 BackendErrorKind::Auth,
-                format!("OAuth2 token endpoint returned {status}: {error_desc}"),
+                format!("token endpoint returned {status}: {error_desc}"),
             ));
         }
 
+        self.cache_token_response(&body, backend_id).await
+    }
+
+    async fn do_authorization_code(
+        &self,
+        token_endpoint: &str,
+        backend_id: &str,
+    ) -> Result<String, BackendError> {
+        // Clone the auth endpoint out of the lock scope before awaiting
+        let auth_endpoint = {
+            let discovered = self.discovered.lock().unwrap();
+            discovered
+                .as_ref()
+                .and_then(|d| d.auth_server_metadata.authorization_endpoint.clone())
+                .unwrap_or_else(|| token_endpoint.to_string())
+        };
+
+        let pkce_methods = {
+            let discovered = self.discovered.lock().unwrap();
+            discovered
+                .as_ref()
+                .and_then(|d| d.auth_server_metadata.code_challenge_methods_supported.clone())
+                .unwrap_or_default()
+        };
+
+        let client_id = self.config.client_id.as_deref().ok_or_else(|| {
+            BackendError::new(BackendErrorKind::Auth, "OAuth2 client_id not configured")
+        })?;
+
+        // Generate PKCE code verifier and challenge
+        let (code_verifier, code_challenge) = if pkce_methods.iter().any(|m| m == "S256") {
+            generate_pkce_s256()
+        } else {
+            generate_pkce_plain()
+        };
+
+        let redirect_uri = "http://localhost:9798/callback";
+        let scopes = self.config.scopes.as_deref().unwrap_or("mcp");
+
+        // Step 1: Direct the user to the authorization endpoint
+        let auth_url = format!(
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256",
+            auth_endpoint, client_id, redirect_uri, scopes, code_challenge
+        );
+
+        tracing::info!(
+            %backend_id,
+            %auth_url,
+            "OAuth2 authorization required - open this URL in a browser"
+        );
+        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  OAuth2 Authorization Required                           ║");
+        eprintln!("║                                                          ║");
+        eprintln!("║  Open this URL in a browser to authorize headless-mcp:   ║");
+        eprintln!("║  {auth_url}");
+        eprintln!("║                                                          ║");
+        eprintln!("╚══════════════════════════════════════════════════════════╝\n");
+
+        // Step 2: Start a local server to receive the callback
+        let code = receive_callback(9798).await?;
+
+        // Step 3: Exchange code for token
+        let response = self
+            .client
+            .post(token_endpoint)
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", client_id),
+                ("code", &code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", &code_verifier),
+            ])
+            .send()
+            .await
+            .map_err(|e| BackendError::new(
+                BackendErrorKind::Auth,
+                format!("token request failed: {e}"),
+            ))?;
+
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.map_err(|e| {
+            BackendError::new(
+                BackendErrorKind::Auth,
+                format!("failed to parse token response: {e}"),
+            )
+        })?;
+
+        if !status.is_success() {
+            let error_desc = body
+                .get("error_description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(BackendError::new(
+                BackendErrorKind::Auth,
+                format!("token endpoint returned {status}: {error_desc}"),
+            ));
+        }
+
+        self.cache_token_response(&body, backend_id).await
+    }
+
+    async fn do_refresh(
+        &self,
+        refresh_token: &str,
+        backend_id: &str,
+    ) -> Result<String, BackendError> {
+        let token_endpoint = self.resolve_token_endpoint()?;
+        let client_id = self.config.client_id.as_deref().unwrap_or("");
+        let client_secret = self.config.client_secret.as_deref().unwrap_or("");
+
+        tracing::debug!(%backend_id, "refreshing OAuth2 token");
+
+        let response = self
+            .client
+            .post(&token_endpoint)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+            ])
+            .send()
+            .await
+            .map_err(|e| BackendError::new(
+                BackendErrorKind::Auth,
+                format!("token refresh failed: {e}"),
+            ))?;
+
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.map_err(|e| {
+            BackendError::new(
+                BackendErrorKind::Auth,
+                format!("failed to parse refresh response: {e}"),
+            )
+        })?;
+
+        if !status.is_success() {
+            let error_desc = body
+                .get("error_description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(BackendError::new(
+                BackendErrorKind::Auth,
+                format!("refresh failed ({status}): {error_desc}"),
+            ));
+        }
+
+        self.cache_token_response(&body, backend_id).await
+    }
+
+    async fn cache_token_response(
+        &self,
+        body: &serde_json::Value,
+        backend_id: &str,
+    ) -> Result<String, BackendError> {
         let access_token = body
             .get("access_token")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                BackendError::new(
-                    BackendErrorKind::Auth,
-                    "OAuth2 token response missing 'access_token'",
-                )
+                BackendError::new(BackendErrorKind::Auth, "response missing 'access_token'")
             })?;
 
-        let expires_in = body
-            .get("expires_in")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3600); // default 1 hour
-
-        // Cache the token
+        let refresh_token = body.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let expires_in = body.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
         let expires_at = Instant::now() + Duration::from_secs(expires_in);
-        *self.token_cache.lock().unwrap() = Some(TokenCache {
+
+        *self.token_cache.lock().await = Some(TokenCache {
             access_token: access_token.to_string(),
+            refresh_token,
             expires_at,
         });
 
-        tracing::info!(%backend_id, expires_in, "OAuth2 token acquired");
-
+        tracing::info!(%backend_id, expires_in, "OAuth2 token cached");
         Ok(access_token.to_string())
     }
 }
 
-/// Parse OAuth2 metadata from a WWW-Authenticate header.
+/// Parse OAuth2 metadata URL from a WWW-Authenticate header.
 /// Per MCP spec: `WWW-Authenticate: Bearer resource_metadata="<url>"`
-pub fn parse_oauth2_metadata(header_value: &str) -> Option<OAuth2Metadata> {
-    // Check for Bearer auth scheme with resource_metadata
+pub fn parse_resource_metadata_url(header_value: &str) -> Option<String> {
     if !header_value.starts_with("Bearer ") {
         return None;
     }
 
-    // Extract resource_metadata URL
     let rest = &header_value[7..]; // after "Bearer "
-    let metadata_url = rest
-        .split(',')
+    rest.split(',')
         .find_map(|part| {
             let part = part.trim();
             if part.starts_with("resource_metadata=\"") {
-                let url = &part[20..]; // after 'resource_metadata="'
-                url.strip_suffix('"')
+                let url = &part[19..];
+                url.strip_suffix('"').map(|s| s.to_string())
             } else {
                 None
             }
+        })
+}
+
+// ── PKCE utilities ──
+
+fn generate_pkce_s256() -> (String, String) {
+    use rand::RngCore;
+    use sha2::{Digest, Sha256};
+
+    let mut verifier_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut verifier_bytes);
+    let verifier = base64_url_no_pad(&verifier_bytes);
+
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let challenge = base64_url_no_pad(&hasher.finalize());
+
+    (verifier, challenge)
+}
+
+fn generate_pkce_plain() -> (String, String) {
+    use rand::RngCore;
+    let mut verifier_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut verifier_bytes);
+    let verifier = base64_url_no_pad(&verifier_bytes);
+    (verifier.clone(), verifier)
+}
+
+fn base64_url_no_pad(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+// ── Local callback server for authorization_code flow ──
+
+use std::net::SocketAddr;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+
+async fn receive_callback(port: u16) -> Result<String, BackendError> {
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let listener = TcpListener::bind(addr).await.map_err(|e| {
+        BackendError::new(
+            BackendErrorKind::Auth,
+            format!("failed to bind callback server: {e}"),
+        )
+    })?;
+
+    tracing::info!("waiting for OAuth2 callback on http://127.0.0.1:{port}/callback");
+
+    // Accept one connection
+    let (mut stream, peer) = listener.accept().await.map_err(|e| {
+        BackendError::new(
+            BackendErrorKind::Auth,
+            format!("callback server accept failed: {e}"),
+        )
+    })?;
+
+    let mut reader = BufReader::new(&mut stream);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).await.map_err(|e| {
+        BackendError::new(BackendErrorKind::Auth, format!("read request failed: {e}"))
+    })?;
+
+    // Parse the code from the URL
+    let code = request_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|path| {
+            path.split('?')
+                .nth(1)
+                .and_then(|query| {
+                    query.split('&').find_map(|param| {
+                        let (k, v) = param.split_once('=')?;
+                        if k == "code" { Some(v.to_string()) } else { None }
+                    })
+                })
+        })
+        .ok_or_else(|| {
+            BackendError::new(BackendErrorKind::Auth, "no authorization code in callback")
         })?;
 
-    // We can't fetch the metadata here (needs async). Return a placeholder
-    // that the caller can fetch.
-    Some(OAuth2Metadata {
-        issuer: None,
-        token_endpoint: metadata_url.to_string(),
-        authorization_endpoint: None,
-        registration_endpoint: None,
-        scopes_supported: None,
-        grant_types_supported: None,
-    })
+    // Send a response to the browser
+    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
+        <html><body><h1>Authorization Complete</h1><p>You can close this window.</p></body></html>";
+    stream.write_all(response.as_bytes()).await.map_err(|e| {
+        BackendError::new(BackendErrorKind::Auth, format!("write response failed: {e}"))
+    })?;
+    stream.shutdown().await.ok();
+
+    tracing::info!("OAuth2 authorization code received");
+    Ok(code)
 }

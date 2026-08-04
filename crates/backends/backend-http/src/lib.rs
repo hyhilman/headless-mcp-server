@@ -15,7 +15,7 @@ use headless_mcp_core::{
 use headless_mcp_wire::{
     decode_message, JsonRpcId, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
 };
-use oauth2::{OAuth2TokenManager, parse_oauth2_metadata};
+use oauth2::{OAuth2TokenManager, parse_resource_metadata_url};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -136,12 +136,16 @@ impl HttpBackend {
             if let Some(ref oauth2_mgr) = self.oauth2 {
                 if let Some(www_auth) = response.headers().get("www-authenticate") {
                     if let Ok(header_value) = www_auth.to_str() {
-                        if let Some(metadata) = parse_oauth2_metadata(header_value) {
+                        if let Some(metadata_url) = parse_resource_metadata_url(header_value) {
                             tracing::info!(
                                 backend_id = %self.def.id,
-                                "detected OAuth2 metadata from WWW-Authenticate header"
+                                %metadata_url,
+                                "OAuth2 resource metadata discovered; running auto-discovery"
                             );
-                            oauth2_mgr.set_metadata(metadata);
+                            // Run discovery asynchronously (best effort)
+                            if let Err(e) = oauth2_mgr.discover(&metadata_url, &self.def.id).await {
+                                tracing::warn!(%e, "OAuth2 discovery failed");
+                            }
                         }
                     }
                 }

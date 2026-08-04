@@ -16,3 +16,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
