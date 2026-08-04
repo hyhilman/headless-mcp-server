@@ -1,0 +1,27 @@
+[package]
+name = "headless-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Binary crate wiring the backend, registry, and MCP wire layers into a running server."
+
+[[bin]]
+name = "headless-mcp"
+path = "src/main.rs"
+
+[dependencies]
+headless-mcp-core = { path = "../core" }
+headless-mcp-secrets = { path = "../secrets" }
+headless-mcp-registry = { path = "../registry" }
+headless-mcp-wire = { path = "../mcp-wire" }
+headless-mcp-server = { path = "../mcp-server" }
+headless-mcp-transport-stdio = { path = "../transport-stdio" }
+headless-mcp-backend-stdio = { path = "../backends/backend-stdio" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+clap.workspace = true

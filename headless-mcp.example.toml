@@ -1,0 +1,39 @@
+# headless-mcp.toml — example configuration
+#
+# Copy this to the working directory or ~/.config/headless-mcp/config.toml
+
+[auth]
+# Hub-level bearer token (required for HTTP mode, ignored in stdio mode)
+# hub_token = "{{env:HEADLESS_MCP_TOKEN}}"
+rate_limit = 120
+
+# --- Backend definitions ---
+#
+# Each backend is defined under [backends.<id>].
+# - transport: "stdio" (spawn process) or "http" (connect to URL)
+# - namespace: prefix applied to all tools from this backend (e.g. "slack")
+# - connection_mode: "eager" (connect at startup), "lazy" (connect on first use), "per-call"
+# - stderr_mode: "log-on-error", "silent", "passthrough", "log-always"
+
+# [backends.slack]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-slack"]
+# env = { SLACK_BOT_TOKEN = "{{env:SLACK_BOT_TOKEN}}" }
+# namespace = "slack"
+# connection_mode = "eager"
+# connect_timeout_secs = 10
+# call_timeout_secs = 30
+# stderr_mode = "log-on-error"
+
+# [backends.postgres]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost:5432/mydb"]
+# namespace = "pg"
+
+# [backends.atlassian]
+# transport = "http"
+# url = "https://mcp.atlassian.com/v1/mcp"
+# bearer_token = "{{env:ATLASSIAN_MCP_TOKEN}}"
+# namespace = "jira"

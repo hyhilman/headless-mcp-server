@@ -1,0 +1,16 @@
+[package]
+name = "headless-mcp-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Backend registry: tool aggregation, namespacing, and route dispatch."
+
+[dependencies]
+headless-mcp-core = { path = "../core" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true

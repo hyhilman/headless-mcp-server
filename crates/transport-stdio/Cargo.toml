@@ -1,0 +1,17 @@
+[package]
+name = "headless-mcp-transport-stdio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Newline-delimited JSON-RPC over stdio for local MCP use."
+
+[dependencies]
+headless-mcp-wire = { path = "../mcp-wire" }
+headless-mcp-server = { path = "../mcp-server" }
+tokio.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
