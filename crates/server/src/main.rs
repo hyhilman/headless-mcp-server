@@ -182,9 +182,9 @@ async fn auth_one(def: &headless_mcp_core::BackendDef, store: Option<Arc<Encrypt
                 println!("   {} tools:", tools.len());
                 for t in &tools { println!("   • {}.{}", def.namespace.as_deref().unwrap_or(""), t.name); }
             }
+            if store.is_some() { println!("   Token persisted."); }
         }
         Err(e) => { eprintln!("❌ {}: {}", def.id, e); }
     }
-    if store.is_some() { println!("   Token persisted."); }
     Ok(())
 }

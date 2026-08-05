@@ -19,7 +19,7 @@ use headless_mcp_core::{
 };
 use headless_mcp_secrets::{EncryptedFileSecretStore, SecretStore};
 use headless_mcp_wire::{
-    decode_message, JsonRpcId, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    decode_message, JsonRpcId, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, SseDecoder,
 };
 use oauth2::{OAuth2TokenManager, parse_resource_metadata_url};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -45,6 +45,8 @@ pub struct HttpBackend {
     default_timeout: Duration,
     /// If true, don't block on interactive OAuth2 flows (daemon mode).
     daemon_mode: bool,
+    /// Mcp-Session-Id from initialize response (required by some servers like Atlassian).
+    session_id: Mutex<Option<String>>,
 }
 
 impl HttpBackend {
@@ -82,6 +84,7 @@ impl HttpBackend {
             request_counter: AtomicU64::new(0),
             default_timeout,
             daemon_mode,
+            session_id: Mutex::new(None),
         }
     }
 
@@ -121,13 +124,19 @@ impl HttpBackend {
         }
     }
 
-    async fn post_json(&self, body: &[u8]) -> Result<(Vec<u8>, reqwest::StatusCode), BackendError> {
+    async fn post_json(&self, body: &[u8]) -> Result<(Vec<u8>, reqwest::StatusCode, reqwest::header::HeaderMap), BackendError> {
         let client = { self.client.lock().unwrap().clone() };
 
-        let response = client
+        let mut req = client
             .post(&self.url)
             .header(CONTENT_TYPE, APPLICATION_JSON)
-            .header(ACCEPT, format!("{APPLICATION_JSON}, {SSE_CONTENT_TYPE}"))
+            .header(ACCEPT, format!("{APPLICATION_JSON}, {SSE_CONTENT_TYPE}"));
+
+        if let Some(ref sid) = *self.session_id.lock().unwrap() {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+
+        let response = req
             .body(body.to_vec())
             .send()
             .await
@@ -168,6 +177,7 @@ impl HttpBackend {
             }
         }
 
+        let headers = response.headers().clone();
         let response_bytes = response.bytes().await.map_err(|e| {
             BackendError::new(
                 BackendErrorKind::Protocol,
@@ -175,7 +185,7 @@ impl HttpBackend {
             )
         })?;
 
-        Ok((response_bytes.to_vec(), status))
+        Ok((response_bytes.to_vec(), status, headers))
     }
 
     async fn send_request(
@@ -192,7 +202,15 @@ impl HttpBackend {
             BackendError::new(BackendErrorKind::Protocol, format!("serialize: {e}"))
         })?;
 
-        let (response_bytes, status) = self.post_json(&body).await?;
+        let (response_bytes, status, headers) = self.post_json(&body).await?;
+
+        // Capture session ID from response (Atlassian MCP sends Mcp-Session-Id)
+        if let Some(sid) = headers.get("mcp-session-id") {
+            if let Ok(val) = sid.to_str() {
+                tracing::debug!(backend_id = %self.def.id, %val, "captured session id");
+                *self.session_id.lock().unwrap() = Some(val.to_string());
+            }
+        }
 
         if status == reqwest::StatusCode::UNAUTHORIZED && retry {
             if let Some(ref oauth2_mgr) = self.oauth2 {
@@ -219,7 +237,12 @@ impl HttpBackend {
                         }
 
                         // Retry
-                        let (retry_bytes, retry_status) = self.post_json(&body).await?;
+                        let (retry_bytes, retry_status, retry_headers) = self.post_json(&body).await?;
+                        if let Some(sid) = retry_headers.get("mcp-session-id") {
+                            if let Ok(val) = sid.to_str() {
+                                *self.session_id.lock().unwrap() = Some(val.to_string());
+                            }
+                        }
                         if retry_status.is_success() {
                             return Self::parse_response(&retry_bytes, &self.def.id);
                         }
@@ -248,7 +271,27 @@ impl HttpBackend {
     }
 
     fn parse_response(response_bytes: &[u8], backend_id: &str) -> Result<Value, BackendError> {
-        let message = decode_message(response_bytes).map_err(|e| {
+        let body_str = String::from_utf8_lossy(response_bytes);
+        tracing::debug!(%backend_id, %body_str, "raw response");
+
+        // Handle SSE-wrapped responses (e.g. Atlassian MCP)
+        let json_bytes: Vec<u8> = if body_str.starts_with("event:") || body_str.starts_with("data:") {
+            let mut decoder = SseDecoder::new();
+            let events = decoder.feed(&body_str);
+            if let Some(event) = events.first() {
+                tracing::debug!(%backend_id, data = %event.data, "parsed SSE event");
+                event.data.as_bytes().to_vec()
+            } else {
+                return Err(BackendError::new(
+                    BackendErrorKind::Protocol,
+                    format!("empty SSE response from '{backend_id}'"),
+                ));
+            }
+        } else {
+            response_bytes.to_vec()
+        };
+
+        let message = decode_message(&json_bytes).map_err(|e| {
             BackendError::new(
                 BackendErrorKind::Protocol,
                 format!("failed to decode response from '{backend_id}': {e}"),
@@ -339,7 +382,8 @@ impl McpBackend for HttpBackend {
             BackendError::new(BackendErrorKind::Protocol, format!("bad init result: {e}"))
         })?;
 
-        self.send_notification("notifications/initialized", None).await?;
+        // Some servers (e.g. Atlassian) reject standalone notifications; ignore.
+        let _ = self.send_notification("notifications/initialized", None).await;
 
         *self.initialize_result.lock().unwrap() = Some(init_result.clone());
         self.connected.store(true, Ordering::SeqCst);

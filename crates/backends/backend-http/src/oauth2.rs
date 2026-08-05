@@ -262,11 +262,12 @@ impl OAuth2TokenManager {
 
     /// Dynamically register a client at the registration endpoint (RFC 7591).
     async fn register_client(&self, backend_id: &str) -> Result<(String, Option<String>), BackendError> {
-        let discovered = self.discovered.lock().unwrap();
-        let registration_endpoint = discovered
-            .as_ref()
-            .and_then(|d| d.auth_server_metadata.registration_endpoint.clone());
-        drop(discovered);
+        let registration_endpoint = {
+            let discovered = self.discovered.lock().unwrap();
+            discovered
+                .as_ref()
+                .and_then(|d| d.auth_server_metadata.registration_endpoint.clone())
+        };
 
         let registration_endpoint = match registration_endpoint {
             Some(url) => url,
@@ -328,12 +329,28 @@ impl OAuth2TokenManager {
         token_endpoint: &str,
         backend_id: &str,
     ) -> Result<String, BackendError> {
-        let client_id = self.config.client_id.as_deref().ok_or_else(|| {
-            BackendError::new(BackendErrorKind::Auth, "OAuth2 client_id not configured")
-        })?;
-        let client_secret = self.config.client_secret.as_deref().ok_or_else(|| {
-            BackendError::new(BackendErrorKind::Auth, "OAuth2 client_secret not configured")
-        })?;
+        let (client_id, client_secret) = if let (Some(cid), Some(cs)) = (&self.config.client_id, &self.config.client_secret) {
+            (cid.clone(), cs.clone())
+        } else if let Some(ref cid) = self.config.client_id {
+            // client_id but no secret — try without secret (some providers allow "none" auth)
+            (cid.clone(), String::new())
+        } else {
+            // Try dynamic registration
+            let reg_endpoint = {
+                let discovered = self.discovered.lock().unwrap();
+                discovered.as_ref().and_then(|d| d.auth_server_metadata.registration_endpoint.clone())
+            };
+            if let Some(ep) = reg_endpoint {
+                let (cid, cs) = self.register_client(backend_id).await?;
+                (cid, cs.unwrap_or_default())
+            } else {
+                return Err(BackendError::new(
+                    BackendErrorKind::Auth,
+                    "OAuth2 client_id not configured and no registration endpoint",
+                ));
+            }
+        };
+
         let scopes = self.config.scopes.as_deref().unwrap_or("mcp");
 
         tracing::debug!(%backend_id, %token_endpoint, %client_id, "running client_credentials grant");
@@ -343,8 +360,8 @@ impl OAuth2TokenManager {
             .post(token_endpoint)
             .form(&[
                 ("grant_type", "client_credentials"),
-                ("client_id", client_id),
-                ("client_secret", client_secret),
+                ("client_id", &*client_id),
+                ("client_secret", &*client_secret),
                 ("scope", scopes),
             ])
             .send()
@@ -398,9 +415,29 @@ impl OAuth2TokenManager {
                 .unwrap_or_default()
         };
 
-        let client_id = self.config.client_id.as_deref().ok_or_else(|| {
-            BackendError::new(BackendErrorKind::Auth, "OAuth2 client_id not configured")
-        })?;
+        // Try dynamic registration if no client_id configured
+        let client_id = if let Some(cid) = &self.config.client_id {
+            cid.clone()
+        } else {
+            let reg_endpoint = {
+                let discovered = self.discovered.lock().unwrap();
+                discovered
+                    .as_ref()
+                    .and_then(|d| d.auth_server_metadata.registration_endpoint.clone())
+            };
+            match reg_endpoint {
+                Some(ep) => {
+                    tracing::info!(%backend_id, %ep, "no client_id, attempting dynamic registration");
+                    self.register_client(backend_id).await?.0
+                }
+                None => {
+                    return Err(BackendError::new(
+                        BackendErrorKind::Auth,
+                        "OAuth2 client_id not configured and no registration endpoint discovered",
+                    ));
+                }
+            }
+        };
 
         // Generate PKCE code verifier and challenge
         let (code_verifier, code_challenge) = if pkce_methods.iter().any(|m| m == "S256") {
@@ -435,7 +472,7 @@ impl OAuth2TokenManager {
 
         tracing::info!(%backend_id, %auth_url, "opening browser for OAuth2 authorization");
 
-        println!("\n═══ Opening browser for Slack authorization ═══");
+        println!("\n═══ Opening browser for {backend_id} authorization ═══");
 
         // Auto-open the browser
         if let Err(_) = open::that(&auth_url) {
@@ -458,7 +495,7 @@ impl OAuth2TokenManager {
             .post(token_endpoint)
             .form(&[
                 ("grant_type", "authorization_code"),
-                ("client_id", client_id),
+                ("client_id", client_id.as_str()),
                 ("code", &code),
                 ("redirect_uri", &redirect_uri),
                 ("code_verifier", &code_verifier),
@@ -660,7 +697,9 @@ async fn receive_callback(port: u16) -> Result<String, BackendError> {
                 .and_then(|query| {
                     query.split('&').find_map(|param| {
                         let (k, v) = param.split_once('=')?;
-                        if k == "code" { Some(v.to_string()) } else { None }
+                        if k == "code" {
+                            Some(percent_decode(v))
+                        } else { None }
                     })
                 })
         })
@@ -678,4 +717,24 @@ async fn receive_callback(port: u16) -> Result<String, BackendError> {
 
     tracing::info!("OAuth2 authorization code received");
     Ok(code)
+}
+
+/// Simple percent-decoding for URL-encoded query parameters.
+fn percent_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let h = chars.next().and_then(|c| c.to_digit(16));
+            let l = chars.next().and_then(|c| c.to_digit(16));
+            if let (Some(h), Some(l)) = (h, l) {
+                out.push(char::from_u32((h << 4) | l).unwrap_or('?'));
+            }
+        } else if c == '+' {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
