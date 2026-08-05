@@ -473,21 +473,46 @@ impl OAuth2TokenManager {
         tracing::info!(%backend_id, %auth_url, "opening browser for OAuth2 authorization");
 
         println!("\n═══ Opening browser for {backend_id} authorization ═══");
+        println!("  URL: {auth_url}");
 
-        // Auto-open the browser
-        if let Err(_) = open::that(&auth_url) {
-            // Fallback: print the URL
-            eprintln!("\n╔══════════════════════════════════════════════════════════╗");
-            eprintln!("║  OAuth2 Authorization Required                           ║");
-            eprintln!("║                                                          ║");
-            eprintln!("║  Open this URL in a browser to authorize headless-mcp:   ║");
-            eprintln!("║  {auth_url}");
-            eprintln!("║                                                          ║");
-            eprintln!("╚══════════════════════════════════════════════════════════╝\n");
-        }
+        let browser_opened = open::that(&auth_url).is_ok();
 
-        // Step 2: Start local callback server
-        let code = receive_callback(redirect_port).await?;
+        // Step 2: Get the authorization code
+        let code = if browser_opened {
+            // Browser opened — use local callback server
+            receive_callback(redirect_port).await?
+        } else {
+            // Headless server — fall back to manual input
+            eprintln!("\n  Browser could not be opened (headless server?)");
+            eprintln!("  1. Open the URL above on your local machine");
+            eprintln!("  2. After authorizing, you'll be redirected to a URL like:");
+            eprintln!("     http://localhost:{redirect_port}/callback?code=XXXX&state=");
+            eprintln!("  3. Paste that full redirect URL below:");
+            eprint!("  > ");
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).map_err(|e| {
+                BackendError::new(BackendErrorKind::Auth, format!("failed to read input: {e}"))
+            })?;
+            let input = input.trim();
+
+            // Parse code from the pasted URL
+            input
+                .split('?')
+                .nth(1)
+                .and_then(|query| {
+                    query.split('&').find_map(|param| {
+                        let (k, v) = param.split_once('=')?;
+                        if k == "code" { Some(percent_decode(v)) } else { None }
+                    })
+                })
+                .ok_or_else(|| {
+                    BackendError::new(
+                        BackendErrorKind::Auth,
+                        "could not parse authorization code from input",
+                    )
+                })?
+        };
 
         // Step 3: Exchange code for token
         let response = self
