@@ -2,7 +2,7 @@
 
 Aggregate multiple MCP servers behind one endpoint.
 
-**Currently supports**: Slack (19 tools), Atlassian Jira+Confluence (31 tools)
+**Currently supports**: Slack (19 tools), Atlassian Jira+Confluence (31 tools), Notion (27 tools)
 
 ## Quick Start
 
@@ -33,6 +33,16 @@ namespace = "jira"
 [backends.atlassian.oauth2]
 grant_type = "authorization_code"
 callback_port = 9798
+
+# Backend: Notion MCP
+[backends.notion]
+transport = "http"
+url = "https://mcp.notion.com/mcp"
+namespace = "notion"
+
+[backends.notion.oauth2]
+grant_type = "authorization_code"
+callback_port = 9799
 EOF
 
 # 4. Authenticate (one-time, opens browser)
@@ -210,6 +220,7 @@ See [docs/mcp/](docs/mcp/) for provider-specific guides:
 
 - [Slack](docs/mcp/slack.md) — 19 tools, OAuth2 with public client
 - [Atlassian](docs/mcp/atlassian.md) — 31 tools, OAuth2 + dynamic registration + SSE
+- [Notion](docs/mcp/notion.md) — 27 tools, OAuth2 + RFC 9728 discovery
 
 ### Pattern for new providers
 
