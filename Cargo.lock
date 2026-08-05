@@ -580,7 +580,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "headless-mcp"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "headless-mcp-backend-http",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "headless-mcp-backend-http"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "headless-mcp-backend-stdio"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "headless-mcp-core",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "headless-mcp-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "headless-mcp-registry"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "headless-mcp-core",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "headless-mcp-secrets"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "headless-mcp-server"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "headless-mcp-core",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "headless-mcp-transport-http"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "axum",
  "governor",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "headless-mcp-transport-stdio"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "headless-mcp-registry",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "headless-mcp-wire"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
