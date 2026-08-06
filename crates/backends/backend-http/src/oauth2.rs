@@ -62,6 +62,8 @@ pub struct OAuth2TokenManager {
     discovered: StdMutex<Option<DiscoveredOAuth2>>,
     /// HTTP client for token requests.
     client: reqwest::Client,
+    /// Singleflight: only one refresh at a time.
+    refresh_lock: Mutex<()>,
 }
 
 impl OAuth2TokenManager {
@@ -71,6 +73,7 @@ impl OAuth2TokenManager {
             token_cache: Mutex::new(None),
             discovered: StdMutex::new(None),
             client: reqwest::Client::new(),
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -210,8 +213,9 @@ impl OAuth2TokenManager {
     }
 
     /// Get a valid access token. Runs discovery, acquires token, caches it.
+    /// Uses singleflight: only one concurrent refresh/re-auth per backend.
     pub async fn get_token(&self, backend_id: &str, daemon_mode: bool) -> Result<String, BackendError> {
-        // Check cache first
+        // Check cache first (fast path, no lock)
         {
             let cache = self.token_cache.lock().await;
             if let Some(cached) = cache.as_ref() {
@@ -221,9 +225,22 @@ impl OAuth2TokenManager {
                 }
 
                 // Try refresh if we have a refresh token
-                if let Some(refresh_token) = &cached.refresh_token {
+                if cached.refresh_token.is_some() {
+                    let refresh_token = cached.refresh_token.clone().unwrap();
+                    drop(cache);
+                    let _guard = self.refresh_lock.lock().await;
+                    // Re-check after acquiring lock
+                    {
+                        let cache = self.token_cache.lock().await;
+                        if let Some(cached) = cache.as_ref() {
+                            if cached.expires_at > Instant::now() + Duration::from_secs(30) {
+                                return Ok(cached.access_token.clone());
+                            }
+                        }
+                    }
+
                     tracing::debug!(%backend_id, "attempting token refresh");
-                    match self.do_refresh(refresh_token, backend_id).await {
+                    match self.do_refresh(&refresh_token, backend_id).await {
                         Ok(new_token) => return Ok(new_token),
                         Err(e) => tracing::warn!(%e, "token refresh failed, will re-acquire"),
                     }
@@ -231,7 +248,18 @@ impl OAuth2TokenManager {
             }
         }
 
-        // Need a new token
+        // Need a new token — singleflight the full acquisition
+        let _guard = self.refresh_lock.lock().await;
+        // Re-check cache (another task may have completed)
+        {
+            let cache = self.token_cache.lock().await;
+            if let Some(cached) = cache.as_ref() {
+                if cached.expires_at > Instant::now() + Duration::from_secs(30) {
+                    return Ok(cached.access_token.clone());
+                }
+            }
+        }
+
         let token_endpoint = self.resolve_token_endpoint()?;
         let grant_type = self.resolve_grant_type()?;
 
