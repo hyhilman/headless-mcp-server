@@ -225,8 +225,7 @@ impl OAuth2TokenManager {
                 }
 
                 // Try refresh if we have a refresh token
-                if cached.refresh_token.is_some() {
-                    let refresh_token = cached.refresh_token.clone().unwrap();
+                if let Some(refresh_token) = cached.refresh_token.clone() {
                     drop(cache);
                     let _guard = self.refresh_lock.lock().await;
                     // Re-check after acquiring lock
@@ -242,8 +241,23 @@ impl OAuth2TokenManager {
                     tracing::debug!(%backend_id, "attempting token refresh");
                     match self.do_refresh(&refresh_token, backend_id).await {
                         Ok(new_token) => return Ok(new_token),
-                        Err(e) => tracing::warn!(%e, "token refresh failed, will re-acquire"),
+                        Err(e) => {
+                            tracing::warn!(%e, "token refresh failed");
+                            if daemon_mode {
+                                return Err(BackendError::new(
+                                    BackendErrorKind::Auth,
+                                    format!("token refresh failed (daemon mode): {e}"),
+                                ));
+                            }
+                            // Non-daemon: fall through to interactive re-auth
+                        }
                     }
+                } else if daemon_mode {
+                    // No refresh token, token expired, in daemon — can't do anything
+                    return Err(BackendError::new(
+                        BackendErrorKind::Auth,
+                        "token expired and no refresh token available (daemon mode — run 'auth' to re-authenticate)",
+                    ));
                 }
             }
         }
@@ -271,9 +285,10 @@ impl OAuth2TokenManager {
             }
             "authorization_code" => {
                 if daemon_mode {
+                    // Shouldn't reach here — refresh path above handles daemon
                     return Err(BackendError::new(
                         BackendErrorKind::Auth,
-                        "authorization_code grant requires interactive consent; run 'headless-mcp --dry-run' to authenticate",
+                        "interactive authorization_code grant blocked in daemon mode",
                     ));
                 }
                 self.do_authorization_code(&token_endpoint, backend_id).await
