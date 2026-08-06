@@ -119,7 +119,8 @@ impl HttpBackend {
 
     async fn persist_token(&self, access_token: &str, refresh_token: Option<&str>, expires_in: u64) {
         if let Some(ref store) = self.token_store {
-            token_store::save_token(store, &self.def.id, access_token, refresh_token, expires_in).await;
+            let client_id = self.oauth2.as_ref().and_then(|o| o.current_client_id());
+            token_store::save_token(store, &self.def.id, access_token, refresh_token, expires_in, client_id.as_deref()).await;
             tracing::debug!(backend_id = %self.def.id, "OAuth2 token persisted");
         }
     }
@@ -359,6 +360,10 @@ impl McpBackend for HttpBackend {
         // Load persisted OAuth2 token if available (async, safe inside runtime)
         if let (Some(ref store), Some(ref oauth2)) = (&self.token_store, &self.oauth2) {
             if let Some(persisted) = token_store::load_token(store, &self.def.id).await {
+                // Restore dynamic client_id for refresh support
+                if let Some(ref cid) = persisted.client_id {
+                    oauth2.set_dynamic_client_id(cid);
+                }
                 if persisted.is_valid() {
                     tracing::info!(backend_id = %self.def.id, "loaded valid persisted token");
                     self.rebuild_client_with_token(&persisted.access_token);

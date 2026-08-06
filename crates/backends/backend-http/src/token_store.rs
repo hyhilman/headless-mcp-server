@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct PersistedToken {
     pub access_token: String,
     pub refresh_token: Option<String>,
+    /// Dynamic client_id (for refresh to work after restart).
+    pub client_id: Option<String>,
     pub expires_at_unix: u64,
 }
 
@@ -44,6 +46,7 @@ pub async fn save_token(
     access_token: &str,
     refresh_token: Option<&str>,
     expires_in_secs: u64,
+    client_id: Option<&str>,
 ) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -53,6 +56,7 @@ pub async fn save_token(
     let token = PersistedToken {
         access_token: access_token.to_string(),
         refresh_token: refresh_token.map(|s| s.to_string()),
+        client_id: client_id.map(|s| s.to_string()),
         expires_at_unix: now + expires_in_secs,
     };
 

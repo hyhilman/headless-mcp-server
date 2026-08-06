@@ -48,6 +48,8 @@ pub struct DiscoveredOAuth2 {
 struct TokenCache {
     access_token: String,
     refresh_token: Option<String>,
+    /// Dynamic client_id (needed for refresh when using dynamic registration).
+    client_id: Option<String>,
     expires_at: Instant,
 }
 
@@ -74,17 +76,42 @@ impl OAuth2TokenManager {
 
     /// Load a cached token (from persistence layer).
     pub fn set_cached_token(&self, access_token: &str, refresh_token: Option<&str>) {
+        let client_id = self.config.client_id.clone();
         let cache = TokenCache {
             access_token: access_token.to_string(),
             refresh_token: refresh_token.map(|s| s.to_string()),
+            client_id,
             expires_at: Instant::now(),
         };
         *self.token_cache.try_lock().expect("token_cache") = Some(cache);
     }
 
+    /// Store a dynamically registered client_id for refresh support.
+    pub fn set_dynamic_client_id(&self, client_id: &str) {
+        if let Ok(mut cache) = self.token_cache.try_lock() {
+            if let Some(ref mut c) = *cache {
+                c.client_id = Some(client_id.to_string());
+            } else {
+                *cache = Some(TokenCache {
+                    access_token: String::new(),
+                    refresh_token: None,
+                    client_id: Some(client_id.to_string()),
+                    expires_at: Instant::now(),
+                });
+            }
+        }
+    }
+
     /// Return current refresh token for persistence.
     pub fn current_refresh_token(&self) -> Option<String> {
         self.token_cache.try_lock().ok()?.as_ref()?.refresh_token.clone()
+    }
+
+    /// Return the current client_id (from config or dynamic registration).
+    pub fn current_client_id(&self) -> Option<String> {
+        self.config.client_id.clone().or_else(|| {
+            self.token_cache.try_lock().ok()?.as_ref()?.client_id.clone()
+        })
     }
 
     /// Get a valid access token.
@@ -340,8 +367,9 @@ impl OAuth2TokenManager {
                 let discovered = self.discovered.lock().unwrap();
                 discovered.as_ref().and_then(|d| d.auth_server_metadata.registration_endpoint.clone())
             };
-            if let Some(ep) = reg_endpoint {
+            if let Some(_ep) = reg_endpoint {
                 let (cid, cs) = self.register_client(backend_id).await?;
+                self.set_dynamic_client_id(&cid);
                 (cid, cs.unwrap_or_default())
             } else {
                 return Err(BackendError::new(
@@ -428,7 +456,9 @@ impl OAuth2TokenManager {
             match reg_endpoint {
                 Some(ep) => {
                     tracing::info!(%backend_id, %ep, "no client_id, attempting dynamic registration");
-                    self.register_client(backend_id).await?.0
+                    let cid = self.register_client(backend_id).await?.0;
+                    self.set_dynamic_client_id(&cid);
+                    cid
                 }
                 None => {
                     return Err(BackendError::new(
@@ -560,7 +590,7 @@ impl OAuth2TokenManager {
         backend_id: &str,
     ) -> Result<String, BackendError> {
         let token_endpoint = self.resolve_token_endpoint()?;
-        let client_id = self.config.client_id.as_deref().unwrap_or("");
+        let client_id = self.current_client_id().unwrap_or_default();
         let client_secret = self.config.client_secret.as_deref().unwrap_or("");
 
         tracing::debug!(%backend_id, "refreshing OAuth2 token");
@@ -571,7 +601,7 @@ impl OAuth2TokenManager {
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
-                ("client_id", client_id),
+                ("client_id", &*client_id),
                 ("client_secret", client_secret),
             ])
             .send()
@@ -618,10 +648,12 @@ impl OAuth2TokenManager {
         let refresh_token = body.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string());
         let expires_in = body.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
         let expires_at = Instant::now() + Duration::from_secs(expires_in);
+        let client_id = self.current_client_id();
 
         *self.token_cache.lock().await = Some(TokenCache {
             access_token: access_token.to_string(),
             refresh_token,
+            client_id,
             expires_at,
         });
 
