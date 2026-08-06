@@ -44,3 +44,7 @@ connection_mode = "eager"
 grant_type = "authorization_code"
 callback_port = 9799
 # No client_id — auto-registered via dynamic client registration (RFC 7591)
+
+# ── Tool filtering (optional) ───────────────────────────────────────────
+# tools_allow = ["getJiraIssue", "searchJiraIssuesUsingJql"]  # only these
+# tools_deny = ["slack_send_message"]                          # hide these

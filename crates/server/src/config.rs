@@ -47,6 +47,10 @@ struct RawBackendConfig {
     pub call_timeout_secs: u64,
     #[serde(default)]
     pub stderr_mode: String,
+    #[serde(default)]
+    pub tools_allow: Vec<String>,
+    #[serde(default)]
+    pub tools_deny: Vec<String>,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -247,6 +251,8 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
             connect_timeout_secs: bc.connect_timeout_secs,
             call_timeout_secs: bc.call_timeout_secs,
             stderr_mode,
+            tools_allow: bc.tools_allow.clone(),
+            tools_deny: bc.tools_deny.clone(),
         });
     }
 

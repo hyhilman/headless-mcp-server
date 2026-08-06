@@ -37,6 +37,16 @@ pub struct BackendDef {
     /// What to do with the backend's stderr output.
     #[serde(default)]
     pub stderr_mode: StderrMode,
+
+    /// Only expose these tools (by downstream name, before namespace prefix).
+    /// Empty = expose all.
+    #[serde(default)]
+    pub tools_allow: Vec<String>,
+
+    /// Hide these tools from the aggregated list.
+    /// Applied after tools_allow.
+    #[serde(default)]
+    pub tools_deny: Vec<String>,
 }
 
 fn default_connect_timeout() -> u64 {

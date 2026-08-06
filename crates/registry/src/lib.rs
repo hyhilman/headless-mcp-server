@@ -119,7 +119,7 @@ impl BackendRegistry {
 
     /// Connect a specific backend and index its tools.
     async fn connect_backend(&self, id: &str) -> Result<(), BackendError> {
-        let (backend, namespace, connection_mode) = {
+        let (backend, namespace, _connection_mode, tools_allow, tools_deny) = {
             let backends = self.backends.read().unwrap();
             let handle = backends.get(id).ok_or_else(|| {
                 BackendError::new(
@@ -131,6 +131,8 @@ impl BackendRegistry {
                 handle.backend.clone(),
                 handle.def.namespace.clone(),
                 handle.def.connection_mode,
+                handle.def.tools_allow.clone(),
+                handle.def.tools_deny.clone(),
             )
         };
 
@@ -138,7 +140,15 @@ impl BackendRegistry {
         backend.connect().await?;
 
         // Fetch tools
-        let tools = backend.list_tools().await?;
+        let mut tools = backend.list_tools().await?;
+
+        // Apply allow/deny filter from backend config
+        if !tools_allow.is_empty() {
+            tools.retain(|t| tools_allow.iter().any(|a| a == &t.name));
+        }
+        if !tools_deny.is_empty() {
+            tools.retain(|t| !tools_deny.iter().any(|d| d == &t.name));
+        }
 
         // Index tools with namespace prefix
         let mut tool_index = self.tool_index.write().unwrap();
@@ -512,6 +522,8 @@ mod tests {
             connect_timeout_secs: 10,
             call_timeout_secs: 30,
             stderr_mode: headless_mcp_core::StderrMode::LogOnError,
+            tools_allow: vec![],
+            tools_deny: vec![],
         }
     }
 

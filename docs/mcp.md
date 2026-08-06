@@ -198,6 +198,20 @@ bearer_token = "{{env:NOTION_TOKEN}}"
 | `http` | `url` + optional `oauth2` | OAuth2 auto-discovery, or `bearer_token` |
 | `stdio` | `command` + optional `args` | None (child process) |
 
+### Tool filtering
+
+Limit which tools are exposed using the downstream tool name (without namespace prefix):
+
+```toml
+[backends.atlassian]
+tools_allow = ["getJiraIssue", "searchJiraIssuesUsingJql"]   # only these
+
+[backends.slack]
+tools_deny = ["slack_send_message", "slack_create_conversation"]  # all except these
+```
+
+`tools_allow` applies first, then `tools_deny`. Both can be combined.
+
 ### Secret interpolation
 
 Use `{{env:VAR}}` for environment variables or `{{secret:NAME}}` for the secret store:
