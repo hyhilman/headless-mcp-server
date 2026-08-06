@@ -165,6 +165,9 @@ async fn run_serve(
             let label = eb.label.clone().unwrap_or_else(|| eb.port.to_string());
             let addr: SocketAddr = bind_addr_from_expose(eb.port);
             let reg = build_expose_registry(&cfg, &eb, store.clone(), daemon).await?;
+            for (id, r) in &reg.connect_all().await {
+                if let Err(e) = r { tracing::warn!(%id, %label, %e, "connect failed"); }
+            }
             let session = Arc::new(McpSession::new(Arc::new(reg), Arc::new(TracingAuditLogger)));
             let token = hub_token.clone();
             tracing::info!(%label, %addr, "starting expose");
