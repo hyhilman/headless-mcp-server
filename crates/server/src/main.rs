@@ -149,17 +149,50 @@ async fn run_serve(
     store: Option<Arc<EncryptedFileSecretStore>>,
     daemon: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = load_config(config_path)?;
+    let mut cfg = load_config(config_path)?;
+
+    // If expose blocks exist, start one HTTP server per port
+    if !cfg.expose.is_empty() {
+        if !http {
+            tracing::warn!("expose blocks defined but --http not set; use 'serve --http'");
+            return Ok(());
+        }
+        let hub_token = cfg.auth.as_ref().and_then(|a| a.hub_token.clone())
+            .unwrap_or_else(|| std::env::var("HEADLESS_MCP_TOKEN").unwrap_or_default());
+        let mut handles = Vec::new();
+        let expose_blocks = std::mem::take(&mut cfg.expose);
+        for eb in expose_blocks {
+            let label = eb.label.clone().unwrap_or_else(|| eb.port.to_string());
+            let addr: SocketAddr = bind_addr_from_expose(eb.port);
+            let reg = build_expose_registry(&cfg, &eb, store.clone(), daemon).await?;
+            let session = Arc::new(McpSession::new(Arc::new(reg), Arc::new(TracingAuditLogger)));
+            let token = hub_token.clone();
+            tracing::info!(%label, %addr, "starting expose");
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = headless_mcp_transport_http::run_http(
+                    session,
+                    headless_mcp_transport_http::HttpTransportConfig {
+                        bind_addr: addr,
+                        bearer_token: token,
+                        rate_limit_per_minute: DEFAULT_RATE_LIMIT,
+                    },
+                ).await {
+                    tracing::error!(%label, %e, "expose server exited");
+                }
+            }));
+        }
+        for h in handles { let _ = h.await; }
+        return Ok(());
+    }
+
+    // No expose blocks: single registry with all backends
     let reg = build_registry(&cfg, store, daemon).await?;
     for (id, r) in &reg.connect_all().await {
         if let Err(e) = r { tracing::warn!(%id, %e, "connect failed"); }
     }
     let session = Arc::new(McpSession::new(Arc::new(reg), Arc::new(TracingAuditLogger)));
     if http {
-        let token = cfg
-            .auth
-            .as_ref()
-            .and_then(|a| a.hub_token.clone())
+        let token = cfg.auth.as_ref().and_then(|a| a.hub_token.clone())
             .unwrap_or_else(|| std::env::var("HEADLESS_MCP_TOKEN").unwrap_or_default());
         headless_mcp_transport_http::run_http(session, headless_mcp_transport_http::HttpTransportConfig {
             bind_addr,
@@ -170,6 +203,40 @@ async fn run_serve(
         headless_mcp_transport_stdio::run_stdio(session).await?;
     }
     Ok(())
+}
+
+fn bind_addr_from_expose(port: u16) -> SocketAddr {
+    format!("127.0.0.1:{port}").parse().unwrap()
+}
+
+async fn build_expose_registry(
+    cfg: &config::HubConfig,
+    eb: &config::ExposeBlock,
+    store: Option<Arc<EncryptedFileSecretStore>>,
+    daemon: bool,
+) -> Result<BackendRegistry, Box<dyn std::error::Error>> {
+    let reg = BackendRegistry::new();
+    for def in &cfg.backends {
+        if let Some(ebc) = eb.backends.get(&def.id) {
+            // Apply expose-level filters on top of backend-level filters
+            let mut def = def.clone();
+            if !ebc.tools_allow.is_empty() { def.tools_allow = ebc.tools_allow.clone(); }
+            if !ebc.tools_deny.is_empty() { def.tools_deny = ebc.tools_deny.clone(); }
+
+            let b: Arc<dyn McpBackend> = match &def.transport {
+                BackendTransport::Stdio { .. } => {
+                    Arc::new(headless_mcp_backend_stdio::StdioBackend::new(def.clone()))
+                }
+                BackendTransport::Http { .. } => {
+                    Arc::new(headless_mcp_backend_http::HttpBackend::with_store(
+                        def.clone(), store.clone(), daemon,
+                    ))
+                }
+            };
+            reg.register(def, b).await?;
+        }
+    }
+    Ok(reg)
 }
 
 // ── tools ──────────────────────────────────────────────────────────────

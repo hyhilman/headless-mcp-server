@@ -3,13 +3,13 @@
 # Copy to your working directory or ~/.config/headless-mcp/config.toml
 # Then run: headless-mcp auth --all
 
-# ── Hub settings ────────────────────────────────────────────────────────
+# ── Auth (optional) ─────────────────────────────────────────────────────
 [auth]
-# Bearer token for HTTP transport (optional)
+# Bearer token for HTTP transport
 # hub_token = "{{env:HEADLESS_MCP_TOKEN}}"
 rate_limit = 120   # requests/minute per IP
 
-# ── Slack MCP (19 tools) ────────────────────────────────────────────────
+# ── Backend: Slack (20 tools) ───────────────────────────────────────────
 [backends.slack]
 transport = "http"
 url = "https://mcp.slack.com/mcp"
@@ -21,7 +21,7 @@ grant_type = "authorization_code"
 client_id = "1601185624273.8899143856786"
 callback_port = 3118
 
-# ── Atlassian MCP (31 tools — Jira + Confluence) ────────────────────────
+# ── Backend: Atlassian Jira + Confluence (31 tools) ────────────────────
 [backends.atlassian]
 transport = "http"
 url = "https://mcp.atlassian.com/v1/mcp"
@@ -31,9 +31,9 @@ connection_mode = "eager"
 [backends.atlassian.oauth2]
 grant_type = "authorization_code"
 callback_port = 9798
-# No client_id — auto-registered via dynamic client registration (RFC 7591)
+# No client_id — auto-registered via RFC 7591
 
-# ── Notion MCP (27 tools) ───────────────────────────────────────────────
+# ── Backend: Notion (35 tools) ──────────────────────────────────────────
 [backends.notion]
 transport = "http"
 url = "https://mcp.notion.com/mcp"
@@ -43,8 +43,20 @@ connection_mode = "eager"
 [backends.notion.oauth2]
 grant_type = "authorization_code"
 callback_port = 9799
-# No client_id — auto-registered via dynamic client registration (RFC 7591)
+# No client_id — auto-registered via RFC 7591
 
-# ── Tool filtering (optional) ───────────────────────────────────────────
-# tools_allow = ["getJiraIssue", "searchJiraIssuesUsingJql"]  # only these
-# tools_deny = ["slack_send_message"]                          # hide these
+# ── Expose: Read-only (port 9797) ───────────────────────────────────────
+[[expose]]
+port = 9797
+label = "read-only"
+[expose.backends.slack]
+tools_allow = ["slack_read_channel", "slack_read_thread", "slack_read_user_profile",
+               "slack_search_public", "slack_search_channels", "slack_search_users"]
+
+# ── Expose: Admin (port 9798) ───────────────────────────────────────────
+[[expose]]
+port = 9798
+label = "admin"
+[expose.backends.slack]      # all tools
+[expose.backends.atlassian]  # all tools
+[expose.backends.notion]     # all tools

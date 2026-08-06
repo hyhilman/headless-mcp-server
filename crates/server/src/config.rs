@@ -10,6 +10,25 @@ struct RawConfig {
     pub auth: Option<RawAuthConfig>,
     #[serde(default)]
     pub backends: HashMap<String, RawBackendConfig>,
+    #[serde(default)]
+    pub expose: Vec<RawExposeBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawExposeBlock {
+    pub port: u16,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub backends: HashMap<String, RawExposeBackend>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawExposeBackend {
+    #[serde(default)]
+    pub tools_allow: Vec<String>,
+    #[serde(default)]
+    pub tools_deny: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +105,24 @@ fn default_grant_type() -> String {
 pub struct HubConfig {
     pub auth: Option<AuthConfig>,
     pub backends: Vec<BackendDef>,
+    /// HTTP expose blocks: port → filtered backends.
+    /// If empty, serve uses stdio or single HTTP with all backends.
+    pub expose: Vec<ExposeBlock>,
+}
+
+/// One HTTP listener exposing a subset of backends.
+#[derive(Debug)]
+pub struct ExposeBlock {
+    pub port: u16,
+    pub label: Option<String>,
+    /// Backend IDs to include, with optional tool filters.
+    pub backends: HashMap<String, ExposeBackendConfig>,
+}
+
+#[derive(Debug)]
+pub struct ExposeBackendConfig {
+    pub tools_allow: Vec<String>,
+    pub tools_deny: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -256,5 +293,22 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
         });
     }
 
-    Ok(HubConfig { auth, backends })
+    // Resolve expose blocks
+    let mut expose = Vec::new();
+    for eb in &raw_config.expose {
+        let mut eb_backends = HashMap::new();
+        for (bid, ebc) in &eb.backends {
+            eb_backends.insert(bid.clone(), ExposeBackendConfig {
+                tools_allow: ebc.tools_allow.clone(),
+                tools_deny: ebc.tools_deny.clone(),
+            });
+        }
+        expose.push(ExposeBlock {
+            port: eb.port,
+            label: eb.label.clone(),
+            backends: eb_backends,
+        });
+    }
+
+    Ok(HubConfig { auth, backends, expose })
 }

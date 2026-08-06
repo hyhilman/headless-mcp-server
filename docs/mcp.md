@@ -1,8 +1,8 @@
 # headless-mcp
 
-Aggregate multiple MCP servers behind one endpoint.
+Aggregate multiple MCP servers behind one endpoint — or many.
 
-**Currently supports**: Slack (19 tools), Atlassian Jira+Confluence (31 tools), Notion (27 tools)
+**Currently supports**: Slack (20 tools), Atlassian Jira+Confluence (31 tools), Notion (35 tools)
 
 ## Quick Start
 
@@ -13,13 +13,24 @@ cargo build --release
 # 2. Set encryption key (do this once, keep it safe)
 export HEADLESS_MCP_MASTER_KEY=$(openssl rand -hex 32)
 
-# 3. Create config
-cat > headless-mcp.toml << 'EOF'
+# 3. Create config (see headless-mcp.example.toml)
+# 4. Authenticate (one-time, opens browser)
+headless-mcp auth --all
+
+# 5. Verify
+headless-mcp tools
+```
+
+## Expose: Multi-port profiles
+
+Define backends once, then expose filtered subsets on different ports:
+
+```toml
+# ── Backend definitions (connection only) ──────────────────────────────
 [backends.slack]
 transport = "http"
 url = "https://mcp.slack.com/mcp"
 namespace = "slack"
-
 [backends.slack.oauth2]
 grant_type = "authorization_code"
 client_id = "1601185624273.8899143856786"
@@ -29,28 +40,36 @@ callback_port = 3118
 transport = "http"
 url = "https://mcp.atlassian.com/v1/mcp"
 namespace = "jira"
-
 [backends.atlassian.oauth2]
 grant_type = "authorization_code"
 callback_port = 9798
 
-# Backend: Notion MCP
-[backends.notion]
-transport = "http"
-url = "https://mcp.notion.com/mcp"
-namespace = "notion"
+# ── Read-only profile :9797 ───────────────────────────────────────────
+[[expose]]
+port = 9797
+label = "read-only"
+[expose.backends.slack]
+tools_allow = ["slack_read_channel", "slack_read_thread", "slack_read_user_profile",
+               "slack_search_public", "slack_search_channels", "slack_search_users"]
+[expose.backends.atlassian]
+tools_allow = ["atlassianUserInfo", "getJiraIssue", "searchJiraIssuesUsingJql"]
 
-[backends.notion.oauth2]
-grant_type = "authorization_code"
-callback_port = 9799
-EOF
-
-# 4. Authenticate (one-time, opens browser)
-headless-mcp auth --all
-
-# 5. Verify
-headless-mcp tools
+# ── Admin profile :9798 ───────────────────────────────────────────────
+[[expose]]
+port = 9798
+label = "admin"
+[expose.backends.slack]     # all tools (no filter)
+[expose.backends.atlassian] # all tools
 ```
+
+```bash
+# Starts both servers — same secrets.json, no duplicate auth
+headless-mcp serve --http
+# → :9797 read-only  (8 tools)
+# → :9798 admin      (51 tools)
+```
+
+Without expose blocks, `serve --http` exposes all backends on a single port.
 
 ## CLI Usage
 
