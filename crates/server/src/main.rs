@@ -17,7 +17,7 @@ use headless_mcp_secrets::EncryptedFileSecretStore;
 use config::load_config;
 use one_shot::run_one_shot;
 
-const DEFAULT_HTTP_BIND: &str = "127.0.0.1:9797";
+const DEFAULT_HTTP_BIND_IP: &str = "127.0.0.1";
 const DEFAULT_RATE_LIMIT: u32 = 120;
 
 #[derive(Parser)]
@@ -77,7 +77,10 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         // serve is always daemon (server can't open browser)
         Some(Commands::Serve { http, bind, port }) => {
-            run_serve(http, config_path, bind_addr(bind, port), token_store, true).await
+            match bind_addr(bind, port) {
+                Ok(addr) => run_serve(http, config_path, addr, token_store, true).await,
+                Err(e) => Err(e.into()),
+            }
         }
         // auth is always non-daemon (must be interactive)
         Some(Commands::Auth { backend }) => {
@@ -99,7 +102,7 @@ async fn main() -> ExitCode {
             run_dry_run(config_path, token_store, cli.no_daemon).await
         }
         None => {
-            run_serve(false, config_path, bind_addr(None, 9797), token_store, true).await
+            run_serve(false, config_path, default_bind(9797), token_store, true).await
         }
     };
 
@@ -114,11 +117,32 @@ async fn main() -> ExitCode {
 
 // ── helpers ────────────────────────────────────────────────────────────
 
-fn bind_addr(bind: Option<String>, port: u16) -> SocketAddr {
-    if let Some(b) = bind {
-        if let Ok(a) = b.parse() { return a; }
+/// Resolve `--bind`, which accepts either `HOST:PORT` or a bare `HOST` (in which
+/// case `--port` supplies the port).
+///
+/// A bare address does not parse as a SocketAddr, so `--bind 0.0.0.0` used to
+/// fall through to loopback silently: the port was honoured, the address was
+/// not, and the only symptom was a connection reset from anywhere but 127.0.0.1.
+/// An address that cannot be parsed at all is now an error rather than a
+/// surprise downgrade to loopback.
+fn bind_addr(bind: Option<String>, port: u16) -> Result<SocketAddr, String> {
+    let Some(b) = bind else {
+        return Ok(default_bind(port));
+    };
+
+    if let Ok(a) = b.parse::<SocketAddr>() {
+        return Ok(a);
     }
-    format!("127.0.0.1:{port}").parse().unwrap()
+    if let Ok(ip) = b.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    Err(format!(
+        "--bind '{b}' is not a valid address; expected HOST:PORT (e.g. 0.0.0.0:{port}) or HOST (e.g. 0.0.0.0)"
+    ))
+}
+
+fn default_bind(port: u16) -> SocketAddr {
+    format!("{DEFAULT_HTTP_BIND_IP}:{port}").parse().unwrap()
 }
 
 fn build_token_store() -> Option<Arc<EncryptedFileSecretStore>> {
@@ -159,6 +183,7 @@ async fn run_serve(
         }
         let hub_token = cfg.auth.as_ref().and_then(|a| a.hub_token.clone())
             .unwrap_or_else(|| std::env::var("HEADLESS_MCP_TOKEN").unwrap_or_default());
+        let rate_limit = cfg.auth.as_ref().map_or(DEFAULT_RATE_LIMIT, |a| a.rate_limit);
         let mut handles = Vec::new();
         let expose_blocks = std::mem::take(&mut cfg.expose);
         for eb in expose_blocks {
@@ -172,19 +197,33 @@ async fn run_serve(
             let token = hub_token.clone();
             tracing::info!(%label, %addr, "starting expose");
             handles.push(tokio::spawn(async move {
-                if let Err(e) = headless_mcp_transport_http::run_http(
+                let result = headless_mcp_transport_http::run_http(
                     session,
                     headless_mcp_transport_http::HttpTransportConfig {
                         bind_addr: addr,
                         bearer_token: token,
-                        rate_limit_per_minute: DEFAULT_RATE_LIMIT,
+                        rate_limit_per_minute: rate_limit,
                     },
-                ).await {
+                ).await;
+                if let Err(ref e) = result {
                     tracing::error!(%label, %e, "expose server exited");
                 }
+                result
             }));
         }
-        for h in handles { let _ = h.await; }
+
+        // A listener that never came up must not look like a clean shutdown: exiting
+        // 0 after every expose block failed reads as success to a supervisor, so the
+        // container stays down quietly instead of reporting a config error.
+        let mut outcomes = Vec::new();
+        for h in handles {
+            outcomes.push(h.await);
+        }
+        let all_failed = !outcomes.is_empty()
+            && outcomes.iter().all(|o| !matches!(o, Ok(Ok(()))));
+        if all_failed {
+            return Err("every expose listener failed to start".into());
+        }
         return Ok(());
     }
 
@@ -200,7 +239,7 @@ async fn run_serve(
         headless_mcp_transport_http::run_http(session, headless_mcp_transport_http::HttpTransportConfig {
             bind_addr,
             bearer_token: token,
-            rate_limit_per_minute: DEFAULT_RATE_LIMIT,
+            rate_limit_per_minute: cfg.auth.as_ref().map_or(DEFAULT_RATE_LIMIT, |a| a.rate_limit),
         }).await?;
     } else {
         headless_mcp_transport_stdio::run_stdio(session).await?;
@@ -387,4 +426,39 @@ async fn auth_one(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_accepts_host_and_port() {
+        assert_eq!(
+            bind_addr(Some("0.0.0.0:1234".into()), 9797).unwrap().to_string(),
+            "0.0.0.0:1234"
+        );
+    }
+
+    /// A bare IP does not parse as a SocketAddr. It used to fall through to
+    /// loopback silently, so `--bind 0.0.0.0` bound 127.0.0.1 and the only
+    /// symptom was a connection reset from anywhere else.
+    #[test]
+    fn bind_accepts_a_bare_ip_and_takes_the_port_from_the_flag() {
+        assert_eq!(
+            bind_addr(Some("0.0.0.0".into()), 9797).unwrap().to_string(),
+            "0.0.0.0:9797"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_bind_is_an_error_not_a_downgrade_to_loopback() {
+        let err = bind_addr(Some("not-an-address".into()), 9797).unwrap_err();
+        assert!(err.contains("not a valid address"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn no_bind_flag_means_loopback() {
+        assert_eq!(bind_addr(None, 9797).unwrap().to_string(), "127.0.0.1:9797");
+    }
 }
