@@ -131,33 +131,44 @@ pub struct AuthConfig {
     pub rate_limit: u32,
 }
 
+const ENV_PREFIX: &str = "{{env:";
+const SECRET_PREFIX: &str = "{{secret:";
+/// Backstop for a placeholder whose value expands to another placeholder
+/// (`FOO="{{env:FOO}}"` would otherwise spin forever).
+const MAX_RESOLVE_PASSES: usize = 16;
+
 /// Resolve `{{env:VAR}}` and `{{secret:NAME}}` placeholders in a string.
+///
+/// An unset variable resolves to `{{unresolved:NAME}}` rather than an empty
+/// string: these values are credentials, and silently substituting "" turns a
+/// typo'd or missing variable into an empty client secret and a mystifying 401.
 fn resolve_value(raw: &str) -> String {
     let mut result = raw.to_string();
-    let mut changed = true;
-    while changed {
-        changed = false;
+
+    for _ in 0..MAX_RESOLVE_PASSES {
+        let mut changed = false;
 
         // Try {{env:...}}
-        if let Some(start) = result.find("{{env:") {
+        if let Some(start) = result.find(ENV_PREFIX) {
             let end = match result[start..].find("}}") {
                 Some(e) => start + e + 2,
                 None => break,
             };
-            let var_name = &result[start + 6..end - 2];
-            let value = std::env::var(var_name).unwrap_or_default();
+            let var_name = &result[start + ENV_PREFIX.len()..end - 2];
+            let value = std::env::var(var_name)
+                .unwrap_or_else(|_| format!("{{{{unresolved:{var_name}}}}}"));
             result.replace_range(start..end, &value);
             changed = true;
         }
 
         // Try {{secret:...}}
         if !changed {
-            if let Some(start) = result.find("{{secret:") {
+            if let Some(start) = result.find(SECRET_PREFIX) {
                 let end = match result[start..].find("}}") {
                     Some(e) => start + e + 2,
                     None => break,
                 };
-                let secret_name = &result[start + 10..end - 2];
+                let secret_name = &result[start + SECRET_PREFIX.len()..end - 2];
                 let env_key = format!("HEADLESS_MCP_SECRET_{}", secret_name.to_uppercase());
                 let value = std::env::var(&env_key).unwrap_or_else(|_| {
                     format!("{{{{unresolved:{secret_name}}}}}")
@@ -165,6 +176,10 @@ fn resolve_value(raw: &str) -> String {
                 result.replace_range(start..end, &value);
                 changed = true;
             }
+        }
+
+        if !changed {
+            break;
         }
     }
     result
@@ -212,8 +227,12 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
     let raw = std::fs::read_to_string(&config_path)?;
     let raw_config: RawConfig = toml::from_str(&raw)?;
 
+    // hub_token goes through resolve_value like every other credential. It was the
+    // one field that did not, while docs/mcp.md documents
+    // `hub_token = "{{env:HEADLESS_MCP_TOKEN}}"` as the way to set it — so the
+    // placeholder was stored verbatim and became the expected bearer token.
     let auth = raw_config.auth.map(|a| AuthConfig {
-        hub_token: a.hub_token,
+        hub_token: a.hub_token.as_deref().map(resolve_value),
         rate_limit: a.rate_limit,
     });
 
@@ -311,4 +330,55 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
     }
 
     Ok(HubConfig { auth, backends, expose })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Each test uses a distinct variable name: cargo runs tests in threads that
+    // share one process environment.
+
+    #[test]
+    fn env_placeholder_resolves() {
+        std::env::set_var("HMCP_TEST_PLAIN", "sekrit");
+        assert_eq!(resolve_value("{{env:HMCP_TEST_PLAIN}}"), "sekrit");
+    }
+
+    /// `{{secret:` is 9 characters; the name was read from offset 10, silently
+    /// dropping its first letter, so `{{secret:NOTION}}` looked up
+    /// HEADLESS_MCP_SECRET_OTION.
+    #[test]
+    fn secret_placeholder_keeps_the_first_letter_of_the_name() {
+        std::env::set_var("HEADLESS_MCP_SECRET_HMCPNOTION", "notion-secret");
+        assert_eq!(resolve_value("{{secret:HmcpNotion}}"), "notion-secret");
+    }
+
+    /// An unset variable must stay visible. Resolving to "" turned a typo into an
+    /// empty credential and an unexplained 401 rather than a startup complaint.
+    #[test]
+    fn unset_env_var_is_reported_not_blanked() {
+        assert_eq!(
+            resolve_value("{{env:HMCP_TEST_DEFINITELY_UNSET}}"),
+            "{{unresolved:HMCP_TEST_DEFINITELY_UNSET}}"
+        );
+    }
+
+    #[test]
+    fn placeholder_inside_surrounding_text_is_substituted_in_place() {
+        std::env::set_var("HMCP_TEST_MID", "xyz");
+        assert_eq!(resolve_value("a-{{env:HMCP_TEST_MID}}-b"), "a-xyz-b");
+    }
+
+    /// A variable whose value is its own placeholder must not spin forever.
+    #[test]
+    fn self_referential_placeholder_terminates() {
+        std::env::set_var("HMCP_TEST_LOOP", "{{env:HMCP_TEST_LOOP}}");
+        assert_eq!(resolve_value("{{env:HMCP_TEST_LOOP}}"), "{{env:HMCP_TEST_LOOP}}");
+    }
+
+    #[test]
+    fn a_value_with_no_placeholder_is_untouched() {
+        assert_eq!(resolve_value("literal-token"), "literal-token");
+    }
 }
