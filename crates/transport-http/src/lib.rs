@@ -39,6 +39,32 @@ pub async fn run_http(
     session: Arc<McpSession>,
     config: HttpTransportConfig,
 ) -> Result<(), std::io::Error> {
+    // Refuse to serve without a token. The check compares raw bytes, so an empty
+    // expected token matches an empty presented one — `Authorization: Bearer `
+    // would authenticate, exposing every backend credential behind this listener
+    // to anything that can open the port.
+    if config.bearer_token.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to start: no bearer token configured (set [auth] hub_token or HEADLESS_MCP_TOKEN)",
+        ));
+    }
+
+    // An unresolved placeholder means the variable behind hub_token was never set.
+    // The literal "{{unresolved:NAME}}" would otherwise become the accepted token —
+    // non-empty, so the check above passes, but derivable by anyone who can read
+    // the config.
+    if config.bearer_token.contains("{{unresolved:") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to start: bearer token still contains an unresolved placeholder ({}); \
+                 the referenced variable is not set",
+                config.bearer_token
+            ),
+        ));
+    }
+
     if !config.bind_addr.ip().is_loopback() {
         tracing::warn!(
             addr = %config.bind_addr,
