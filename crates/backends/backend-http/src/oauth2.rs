@@ -79,14 +79,22 @@ impl OAuth2TokenManager {
 
     /// Load a cached token (from persistence layer).
     pub fn set_cached_token(&self, access_token: &str, refresh_token: Option<&str>) {
-        let client_id = self.config.client_id.clone();
-        let cache = TokenCache {
+        let mut cache = self.token_cache.try_lock().expect("token_cache");
+        // Keep any dynamically registered client_id already in the cache. A refresh
+        // token is only valid for the client it was issued to, and a DCR backend has
+        // no client_id in config — so taking config's `None` here would strip the id
+        // that set_dynamic_client_id just restored and make every refresh fail.
+        let client_id = self
+            .config
+            .client_id
+            .clone()
+            .or_else(|| cache.as_ref().and_then(|c| c.client_id.clone()));
+        *cache = Some(TokenCache {
             access_token: access_token.to_string(),
             refresh_token: refresh_token.map(|s| s.to_string()),
             client_id,
             expires_at: Instant::now(),
-        };
-        *self.token_cache.try_lock().expect("token_cache") = Some(cache);
+        });
     }
 
     /// Store a dynamically registered client_id for refresh support.
@@ -688,7 +696,15 @@ impl OAuth2TokenManager {
                 BackendError::new(BackendErrorKind::Auth, "response missing 'access_token'")
             })?;
 
-        let refresh_token = body.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string());
+        // RFC 6749 §6 makes refresh_token optional in a refresh response; when it is
+        // absent the old one stays valid. Dropping it here left the manager with no
+        // refresh token, which also skipped persistence (the caller only writes when
+        // one is present) — so a successful refresh never reached disk.
+        let refresh_token = body
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| self.current_refresh_token());
         let expires_in = body.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
         let expires_at = Instant::now() + Duration::from_secs(expires_in);
         let client_id = self.current_client_id();
@@ -837,4 +853,92 @@ fn percent_decode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Config for a backend that uses RFC 7591 dynamic registration: no client_id.
+    fn dcr_config() -> OAuth2Config {
+        OAuth2Config {
+            token_endpoint: Some("https://example.test/token".into()),
+            client_id: None,
+            client_secret: None,
+            scopes: None,
+            grant_type: "authorization_code".into(),
+            callback_port: 9798,
+        }
+    }
+
+    fn static_config() -> OAuth2Config {
+        OAuth2Config { client_id: Some("static-cid".into()), ..dcr_config() }
+    }
+
+    /// The restart path: connect() restores the persisted dynamic client_id, then
+    /// loads the persisted token. Loading the token must not wipe the client_id —
+    /// a refresh token is only valid for the client it was issued to, so losing it
+    /// made every refresh fail for Atlassian/Notion while Slack (static id) worked.
+    #[test]
+    fn set_cached_token_keeps_the_dynamic_client_id() {
+        let mgr = OAuth2TokenManager::new(dcr_config());
+
+        mgr.set_dynamic_client_id("dyn-cid");
+        mgr.set_cached_token("access-tok", Some("refresh-tok"));
+
+        assert_eq!(mgr.current_client_id().as_deref(), Some("dyn-cid"));
+        assert_eq!(mgr.current_refresh_token().as_deref(), Some("refresh-tok"));
+    }
+
+    /// A configured client_id still wins over anything cached.
+    #[test]
+    fn config_client_id_takes_precedence() {
+        let mgr = OAuth2TokenManager::new(static_config());
+
+        mgr.set_dynamic_client_id("dyn-cid");
+        mgr.set_cached_token("access-tok", Some("refresh-tok"));
+
+        assert_eq!(mgr.current_client_id().as_deref(), Some("static-cid"));
+    }
+
+    /// With no dynamic registration and no config, there is simply no client_id.
+    #[test]
+    fn no_client_id_anywhere_stays_none() {
+        let mgr = OAuth2TokenManager::new(dcr_config());
+        mgr.set_cached_token("access-tok", Some("refresh-tok"));
+        assert_eq!(mgr.current_client_id(), None);
+    }
+
+    /// RFC 6749 §6: refresh_token is optional in a refresh response; when omitted
+    /// the previous one stays valid. Dropping it stranded the manager with no
+    /// refresh token, which also skipped persistence on the caller's side.
+    #[tokio::test]
+    async fn refresh_response_without_a_refresh_token_keeps_the_old_one() {
+        let mgr = OAuth2TokenManager::new(dcr_config());
+        mgr.set_dynamic_client_id("dyn-cid");
+        mgr.set_cached_token("old-access", Some("keep-me"));
+
+        let body = serde_json::json!({ "access_token": "new-access", "expires_in": 3600 });
+        let token = mgr.cache_token_response(&body, "test").await.unwrap();
+
+        assert_eq!(token, "new-access");
+        assert_eq!(mgr.current_refresh_token().as_deref(), Some("keep-me"));
+        assert_eq!(mgr.current_client_id().as_deref(), Some("dyn-cid"));
+    }
+
+    /// A rotated refresh token in the response replaces the old one.
+    #[tokio::test]
+    async fn refresh_response_with_a_new_refresh_token_rotates_it() {
+        let mgr = OAuth2TokenManager::new(dcr_config());
+        mgr.set_cached_token("old-access", Some("old-refresh"));
+
+        let body = serde_json::json!({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        });
+        mgr.cache_token_response(&body, "test").await.unwrap();
+
+        assert_eq!(mgr.current_refresh_token().as_deref(), Some("new-refresh"));
+    }
 }
