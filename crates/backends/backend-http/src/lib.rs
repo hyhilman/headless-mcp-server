@@ -215,27 +215,21 @@ impl HttpBackend {
 
         if status == reqwest::StatusCode::UNAUTHORIZED && retry {
             if let Some(ref oauth2_mgr) = self.oauth2 {
-                if self.daemon_mode {
-                    tracing::warn!(
-                        backend_id = %self.def.id,
-                        "OAuth2 re-authorization needed but running in daemon mode — backend marked unhealthy"
-                    );
-                    return Err(BackendError::new(
-                        BackendErrorKind::Auth,
-                        "OAuth2 re-authorization required (daemon mode — run 'headless-mcp --dry-run' to re-authenticate)",
-                    ));
-                }
-
+                // Deliberately NOT gated on daemon_mode. A refresh_token grant needs no
+                // browser, and returning here meant the daemon never spent the refresh
+                // token connect() had just loaded — every restart demanded a consent.
+                // get_token() blocks the interactive grants in daemon mode itself.
                 tracing::info!(backend_id = %self.def.id, "attempting OAuth2 token acquisition");
 
                 match oauth2_mgr.get_token(&self.def.id, self.daemon_mode).await {
                     Ok(token) => {
                         self.rebuild_client_with_token(&token);
 
-                        // Persist the token
-                        if let Some(refresh) = oauth2_mgr.current_refresh_token() {
-                            self.persist_token(&token, Some(&refresh), 3600).await;
-                        }
+                        // Persist the token. Unconditional: a backend without a refresh
+                        // token still needs its access token to survive a restart, and
+                        // gating on one meant those writes were silently skipped.
+                        let refresh = oauth2_mgr.current_refresh_token();
+                        self.persist_token(&token, refresh.as_deref(), 3600).await;
 
                         // Retry
                         let (retry_bytes, retry_status, retry_headers) = self.post_json(&body).await?;
