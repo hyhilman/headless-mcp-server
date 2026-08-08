@@ -393,7 +393,9 @@ impl McpBackend for HttpBackend {
 
     async fn list_tools(&self) -> BackendResult<Vec<ToolDescriptor>> {
         self.check_connected()?;
-        let result = self.send_request("tools/list", None, false).await?;
+        // retry:true — a long-lived daemon connection outlives the access token; only
+        // `initialize` used to refresh it, so every call after that silently 401'd forever.
+        let result = self.send_request("tools/list", None, true).await?;
         let tools_list = result.get("tools").and_then(|v| v.as_array()).ok_or_else(|| {
             BackendError::new(BackendErrorKind::Protocol, "no 'tools' array in response")
         })?;
@@ -405,7 +407,9 @@ impl McpBackend for HttpBackend {
     async fn call_tool(&self, name: &str, arguments: Option<Value>, _timeout: Duration) -> BackendResult<Value> {
         self.check_connected()?;
         let params = serde_json::json!({ "name": name, "arguments": arguments.unwrap_or(Value::Object(serde_json::Map::new())) });
-        self.send_request("tools/call", Some(params), false).await
+        // retry:true — same reasoning as list_tools: this is every actual tool invocation
+        // (e.g. slack.slack_send_message), so it's the path that most needs to self-heal.
+        self.send_request("tools/call", Some(params), true).await
     }
 
     async fn disconnect(&self) -> BackendResult<()> {
@@ -416,11 +420,137 @@ impl McpBackend for HttpBackend {
 
     async fn health_check(&self) -> BackendResult<()> {
         self.check_connected()?;
-        self.send_request("tools/list", None, false).await?;
+        // retry:true — same bug as list_tools/call_tool: a probe hitting an expired
+        // token would otherwise report unhealthy forever instead of self-healing.
+        self.send_request("tools/list", None, true).await?;
         Ok(())
     }
 
     fn protocol_version(&self) -> Option<&str> { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Reads one HTTP/1.1 request off `stream` (request line + headers + any
+    /// Content-Length body) and returns its method.
+    async fn read_request_method(stream: &mut TcpStream) -> String {
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).await.unwrap();
+        let method = request_line.split_whitespace().next().unwrap_or("").to_string();
+
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+        if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+        }
+        method
+    }
+
+    async fn write_response(stream: &mut TcpStream, status: u16, status_text: &str, body: &str) {
+        let resp = format!(
+            "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(resp.as_bytes()).await.unwrap();
+        stream.shutdown().await.ok();
+    }
+
+    /// A downstream MCP backend that 401s the first `tools/call` POST — simulating an
+    /// access token that expired mid-session — then succeeds the retried one. The
+    /// interleaved discovery GET (unconditional on any 401, see `post_json`) gets a
+    /// plain 404, which is harmless: `discover()` failing is only ever logged.
+    async fn spawn_flaky_backend() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut post_count = 0;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let method = read_request_method(&mut stream).await;
+                if method == "POST" {
+                    post_count += 1;
+                    if post_count == 1 {
+                        write_response(&mut stream, 401, "Unauthorized", "{}").await;
+                    } else {
+                        let body = serde_json::json!({
+                            "jsonrpc": "2.0", "id": 0, "result": { "ok": true },
+                        })
+                        .to_string();
+                        write_response(&mut stream, 200, "OK", &body).await;
+                        break;
+                    }
+                } else {
+                    write_response(&mut stream, 404, "Not Found", "{}").await;
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The OAuth2 token endpoint: answers one client_credentials grant.
+    async fn spawn_token_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_request_method(&mut stream).await;
+                let body = serde_json::json!({
+                    "access_token": "test-access-token",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                })
+                .to_string();
+                write_response(&mut stream, 200, "OK", &body).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Regression test for the `retry:false` bug: `call_tool` hitting a 401 on an
+    /// otherwise-connected backend must refresh via OAuth2 and retry, not fail
+    /// straight through. Before this fix `call_tool`/`list_tools`/`health_check` all
+    /// passed `retry:false` to `send_request`, so the 401 branch that calls
+    /// `get_token()` and retries never ran — every call failed until a full backend
+    /// reconnect. This is what silently broke Slack sends for hours in production
+    /// (the token refreshed once at connect-time `initialize`, which alone uses
+    /// `retry:true`, and never again).
+    #[tokio::test]
+    async fn call_tool_recovers_from_an_expired_token() {
+        let backend_url = spawn_flaky_backend().await;
+        let token_url = spawn_token_server().await;
+
+        let def: BackendDef = serde_json::from_value(serde_json::json!({
+            "id": "test-backend",
+            "transport": "http",
+            "url": backend_url,
+            "oauth2": {
+                "token_endpoint": token_url,
+                "client_id": "test-client",
+                "client_secret": "test-secret",
+            },
+        }))
+        .unwrap();
+
+        let backend = HttpBackend::with_store(def, None, true);
+        backend.connected.store(true, Ordering::SeqCst);
+
+        let result = backend.call_tool("some.tool", None, Duration::from_secs(5)).await;
+        assert!(result.is_ok(), "call_tool should recover after refreshing the token: {result:?}");
+    }
 }
 
 impl HttpBackend {
