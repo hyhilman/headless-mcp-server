@@ -125,6 +125,41 @@ impl HttpBackend {
         }
     }
 
+    /// Adopt a token another instance of this same backend may have written since we last looked.
+    ///
+    /// WHY THIS EXISTS. `build_expose_registry` constructs one `HttpBackend` PER EXPOSE BLOCK, so a
+    /// backend named in two blocks is two objects with two independent `OAuth2Manager`s — and they
+    /// share exactly one persisted entry, `oauth2:<id>:token`, which each reads once in `connect()`.
+    ///
+    /// That is survivable until the provider ROTATES refresh tokens, which Slack does: a refresh
+    /// returns a new refresh token and retires the one presented. The instance that refreshes first
+    /// updates its own memory and the store; the other still holds the retired token forever and
+    /// every later refresh returns 400. Observed on a two-profile Slack setup: the read profile
+    /// (called hourly) kept winning, and the write profile served exactly one access-token lifetime
+    /// of traffic — 23 sends over 11.5h — then failed permanently.
+    ///
+    /// So: re-read before spending our copy. A still-valid access token is adopted with its
+    /// REMAINING life (not expired-on-arrival, or we would spend a rotated refresh token to replace
+    /// a token that is fine); an expired one is adopted anyway, because its refresh token is
+    /// strictly fresher than ours.
+    async fn adopt_persisted_token(&self, oauth2: &OAuth2TokenManager) {
+        let Some(ref store) = self.token_store else { return };
+        let Some(persisted) = token_store::load_token(store, &self.def.id).await else { return };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let remaining = persisted.expires_at_unix.saturating_sub(now);
+        if let Some(cid) = persisted.client_id.as_deref() {
+            oauth2.set_dynamic_client_id(cid);
+        }
+        oauth2.set_cached_token_valid_for(
+            &persisted.access_token,
+            persisted.refresh_token(),
+            Duration::from_secs(remaining),
+        );
+    }
+
     async fn post_json(&self, body: &[u8]) -> Result<(Vec<u8>, reqwest::StatusCode, reqwest::header::HeaderMap), BackendError> {
         let client = { self.client.lock().unwrap().clone() };
 
@@ -219,6 +254,11 @@ impl HttpBackend {
                 // browser, and returning here meant the daemon never spent the refresh
                 // token connect() had just loaded — every restart demanded a consent.
                 // get_token() blocks the interactive grants in daemon mode itself.
+                // A sibling instance of this backend (another expose block) may have refreshed
+                // and rotated the shared refresh token since we last read it. See
+                // `adopt_persisted_token` — without this, the losing instance 400s forever.
+                self.adopt_persisted_token(oauth2_mgr).await;
+
                 tracing::info!(backend_id = %self.def.id, "attempting OAuth2 token acquisition");
 
                 match oauth2_mgr.get_token(&self.def.id, self.daemon_mode).await {
@@ -228,8 +268,15 @@ impl HttpBackend {
                         // Persist the token. Unconditional: a backend without a refresh
                         // token still needs its access token to survive a restart, and
                         // gating on one meant those writes were silently skipped.
+                        //
+                        // The lifetime is the token's OWN, not a flat hour. Slack issues 12h
+                        // tokens; recording them as 1h had every instance re-refreshing 11 times
+                        // more often than needed, and each refresh is a rotation another instance
+                        // can lose — the hardcoded 3600 was what made the race constant rather
+                        // than rare.
                         let refresh = oauth2_mgr.current_refresh_token();
-                        self.persist_token(&token, refresh.as_deref(), 3600).await;
+                        let expires_in = oauth2_mgr.current_expires_in().unwrap_or(3600);
+                        self.persist_token(&token, refresh.as_deref(), expires_in).await;
 
                         // Retry
                         let (retry_bytes, retry_status, retry_headers) = self.post_json(&body).await?;
@@ -550,6 +597,113 @@ mod tests {
 
         let result = backend.call_tool("some.tool", None, Duration::from_secs(5)).await;
         assert!(result.is_ok(), "call_tool should recover after refreshing the token: {result:?}");
+    }
+
+    /// A token endpoint that ROTATES: it accepts exactly one refresh token, hands back the next
+    /// one, and answers 400 to any other — which is what Slack does, and what turns two instances
+    /// of one backend into a permanent outage for whichever refreshes second.
+    async fn spawn_rotating_token_server(accepts: &'static str, issues: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).await.unwrap();
+                    if h == "\r\n" || h.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).await.unwrap();
+                let form = String::from_utf8_lossy(&body).to_string();
+
+                if form.contains(&format!("refresh_token={accepts}")) {
+                    let ok = serde_json::json!({
+                        "access_token": "rotated-access",
+                        "refresh_token": issues,
+                        "token_type": "bearer",
+                        "expires_in": 3600,
+                    })
+                    .to_string();
+                    write_response(&mut stream, 200, "OK", &ok).await;
+                } else {
+                    write_response(&mut stream, 400, "Bad Request", "{\"error\":\"invalid_grant\"}").await;
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Regression test for the two-instance rotation race.
+    ///
+    /// `build_expose_registry` builds one `HttpBackend` per expose block, so a backend named in two
+    /// blocks is two objects with two token caches over ONE persisted entry. Here instance B holds
+    /// the pre-rotation refresh token in memory while the store already carries the rotated one —
+    /// exactly the state the read profile leaves the write profile in. B must adopt the stored
+    /// token before spending its own; presenting the retired one gets 400 forever, which is what
+    /// took Slack sends down for 15 hours.
+    #[tokio::test]
+    async fn a_second_instance_adopts_a_rotated_token_instead_of_spending_a_retired_one() {
+        let backend_url = spawn_flaky_backend().await;
+        // Accepts ONLY the rotated token the store holds; the stale in-memory one is refused.
+        let token_url = spawn_rotating_token_server("stored-refresh", "next-refresh").await;
+
+        let dir = std::env::temp_dir().join(format!("hmcp-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(
+            EncryptedFileSecretStore::with_master_key_hex(
+                dir.join("secrets.json"),
+                &"ab".repeat(32),
+            )
+            .unwrap(),
+        );
+
+        // What instance A left behind after IT refreshed and rotated: an expired access token and
+        // the only refresh token the provider will still honour.
+        token_store::save_token(&store, "rot-backend", "old-access", Some("stored-refresh"), 0, Some("test-client")).await;
+
+        let def: BackendDef = serde_json::from_value(serde_json::json!({
+            "id": "rot-backend",
+            "transport": "http",
+            "url": backend_url,
+            "oauth2": {
+                "token_endpoint": token_url,
+                "client_id": "test-client",
+                "client_secret": "test-secret",
+            },
+        }))
+        .unwrap();
+
+        let backend = HttpBackend::with_store(def, Some(store.clone()), true);
+        backend.connected.store(true, Ordering::SeqCst);
+        // Instance B's stale view: the refresh token that was valid before A rotated it.
+        if let Some(ref o) = backend.oauth2 {
+            o.set_cached_token("old-access", Some("retired-refresh"));
+        }
+
+        let result = backend.call_tool("some.tool", None, Duration::from_secs(5)).await;
+        assert!(
+            result.is_ok(),
+            "a second instance must adopt the stored (rotated) refresh token, not spend its retired one: {result:?}"
+        );
+
+        // And it must write the rotation forward, so the next instance to look finds the live one.
+        let after = token_store::load_token(&store, "rot-backend").await.unwrap();
+        assert_eq!(
+            after.refresh_token(),
+            Some("next-refresh"),
+            "the rotated refresh token must be persisted for the sibling instance"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

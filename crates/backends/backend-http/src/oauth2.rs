@@ -97,6 +97,44 @@ impl OAuth2TokenManager {
         });
     }
 
+    /// Load a cached token that still has life left in it.
+    ///
+    /// `set_cached_token` deliberately marks the token expired-on-arrival so the first use forces a
+    /// refresh, which is right for `connect()`. It is wrong when the token was just written by
+    /// ANOTHER instance of this same backend: there the access token is live, and treating it as
+    /// expired spends a refresh token that has already been rotated away.
+    pub fn set_cached_token_valid_for(
+        &self,
+        access_token: &str,
+        refresh_token: Option<&str>,
+        valid_for: Duration,
+    ) {
+        let mut cache = self.token_cache.try_lock().expect("token_cache");
+        let client_id = self
+            .config
+            .client_id
+            .clone()
+            .or_else(|| cache.as_ref().and_then(|c| c.client_id.clone()));
+        *cache = Some(TokenCache {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.map(|s| s.to_string()),
+            client_id,
+            expires_at: Instant::now() + valid_for,
+        });
+    }
+
+    /// Seconds of life left on the cached access token, for persisting a real expiry.
+    pub fn current_expires_in(&self) -> Option<u64> {
+        let cache = self.token_cache.try_lock().ok()?;
+        let cached = cache.as_ref()?;
+        Some(
+            cached
+                .expires_at
+                .saturating_duration_since(Instant::now())
+                .as_secs(),
+        )
+    }
+
     /// Store a dynamically registered client_id for refresh support.
     pub fn set_dynamic_client_id(&self, client_id: &str) {
         if let Ok(mut cache) = self.token_cache.try_lock() {
