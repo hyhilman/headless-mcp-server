@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
@@ -49,6 +49,9 @@ pub struct VpnDef {
     pub url_wait_secs: u64,
     /// How long the login process may wait for the user before it is killed.
     pub login_timeout_secs: u64,
+    /// Local ports the login command listens on for its browser redirect.
+    /// Non-empty enables paste-back ([`VpnManager::complete_login`]).
+    pub callback_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -356,6 +359,37 @@ impl VpnManager {
         Ok(LoginOutcome::Pending { login })
     }
 
+    /// Whether this VPN accepts a pasted-back localhost redirect.
+    pub fn supports_paste_back(&self, name: &str) -> bool {
+        self.entries
+            .get(name)
+            .is_some_and(|e| !e.def.callback_ports.is_empty())
+    }
+
+    /// Finish a browser-redirect login whose redirect landed on the user's
+    /// own machine: forward the pasted `http://localhost:<port>/...` address
+    /// to the login command listening on this host.
+    ///
+    /// Only accepted while a login is pending, and only for loopback hosts
+    /// on one of the configured `callback_ports`.
+    pub async fn complete_login(&self, name: &str, callback_url: &str) -> Result<String, VpnError> {
+        let entry = self.entry(name)?;
+        if entry.def.callback_ports.is_empty() {
+            return Err(VpnError(format!("paste-back is not enabled for VPN '{name}'")));
+        }
+        if entry.status.lock().unwrap().login.is_none() {
+            return Err(VpnError(format!(
+                "no login is waiting for VPN '{name}'; start one with the login tool first"
+            )));
+        }
+        let target = parse_callback_url(callback_url, &entry.def.callback_ports)?;
+        let status = tokio::time::timeout(Duration::from_secs(10), forward_callback(&target))
+            .await
+            .map_err(|_| VpnError("timed out forwarding the callback".into()))??;
+        tracing::info!(vpn = %name, port = target.port, %status, "login callback forwarded");
+        Ok(status)
+    }
+
     fn entry(&self, name: &str) -> Result<Arc<Entry>, VpnError> {
         self.entries
             .get(name)
@@ -393,6 +427,74 @@ fn extract_url(line: &str, prefixes: &[String]) -> Option<String> {
         .unwrap_or(rest.len());
     let url = rest[..end].trim_end_matches(['.', ',', ')', ']', ';']);
     (!url.is_empty()).then(|| url.to_string())
+}
+
+#[derive(Debug, PartialEq)]
+struct CallbackTarget {
+    ipv6: bool,
+    port: u16,
+    path_and_query: String,
+}
+
+fn parse_callback_url(url: &str, allowed_ports: &[u16]) -> Result<CallbackTarget, VpnError> {
+    let bad = |why: &str| VpnError(format!("invalid callback address: {why}"));
+    let url = url.trim();
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(bad("contains whitespace or control characters"));
+    }
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| bad("must start with http://"))?;
+    let split = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(split);
+    if authority.contains('@') {
+        return Err(bad("credentials are not allowed"));
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| bad("missing port"))?;
+    let ipv6 = match host {
+        "localhost" | "127.0.0.1" => false,
+        "[::1]" => true,
+        _ => return Err(bad("host must be localhost")),
+    };
+    let port: u16 = port.parse().map_err(|_| bad("bad port"))?;
+    if !allowed_ports.contains(&port) {
+        return Err(bad(&format!("port {port} is not an allowed callback port")));
+    }
+    let path_and_query = match path {
+        "" => "/".to_string(),
+        p if p.starts_with('?') => format!("/{p}"),
+        p => p.to_string(),
+    };
+    Ok(CallbackTarget { ipv6, port, path_and_query })
+}
+
+/// Minimal HTTP/1.1 GET to the loopback listener; returns the status line.
+async fn forward_callback(target: &CallbackTarget) -> Result<String, VpnError> {
+    let addr = if target.ipv6 {
+        std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, target.port))
+    } else {
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, target.port))
+    };
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| VpnError(format!("nothing is listening on port {}: {e}", target.port)))?;
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+        target.path_and_query, target.port
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| VpnError(format!("failed to send callback: {e}")))?;
+    let mut buf = vec![0u8; 1024];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .map_err(|e| VpnError(format!("failed to read callback response: {e}")))?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    Ok(head.lines().next().unwrap_or("").trim().to_string())
 }
 
 fn spawn_piped(argv: &[String]) -> Result<tokio::process::Child, VpnError> {
@@ -480,7 +582,57 @@ mod tests {
             command_timeout_secs: 5,
             url_wait_secs: 5,
             login_timeout_secs: 5,
+            callback_ports: vec![],
         }
+    }
+
+    #[test]
+    fn callback_url_must_be_loopback_on_allowed_port() {
+        let ports = [53000];
+        assert_eq!(
+            parse_callback_url("http://localhost:53000/?code=abc&state=xyz", &ports).unwrap(),
+            CallbackTarget { ipv6: false, port: 53000, path_and_query: "/?code=abc&state=xyz".into() }
+        );
+        assert_eq!(
+            parse_callback_url("http://127.0.0.1:53000?code=1", &ports).unwrap().path_and_query,
+            "/?code=1"
+        );
+        for bad in [
+            "https://localhost:53000/",
+            "http://evil.example:53000/",
+            "http://localhost:22/",
+            "http://user@localhost:53000/",
+            "http://localhost:53000/a b",
+            "http://localhost.evil.example:53000/",
+        ] {
+            assert!(parse_callback_url(bad, &ports).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_login_forwards_to_local_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let mut d = def("echo NeedsLogin", "echo 'open https://idp.example/auth'; sleep 3");
+        d.callback_ports = vec![port];
+        let m = VpnManager::new(vec![d]);
+
+        // Rejected while no login is pending.
+        let url = format!("http://localhost:{port}/?code=abc");
+        assert!(m.complete_login("netbird", &url).await.is_err());
+
+        m.start_login("netbird").await.unwrap();
+        let status = m.complete_login("netbird", &url).await.unwrap();
+        assert!(status.contains("200"), "{status}");
+        assert!(server.await.unwrap().starts_with("GET /?code=abc HTTP/1.1"));
     }
 
     #[test]

@@ -39,6 +39,8 @@ struct RawVpnConfig {
     pub url_wait_secs: u64,
     #[serde(default = "default_vpn_login_timeout")]
     pub login_timeout_secs: u64,
+    #[serde(default)]
+    pub callback_ports: Vec<u16>,
 }
 
 fn default_url_prefixes() -> Vec<String> {
@@ -292,6 +294,7 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
             command_timeout_secs: vc.command_timeout_secs,
             url_wait_secs: vc.url_wait_secs,
             login_timeout_secs: vc.login_timeout_secs,
+            callback_ports: vc.callback_ports.clone(),
         });
     }
     let check_vpn = |owner: String, names: &[String]| -> Result<(), String> {

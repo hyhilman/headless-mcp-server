@@ -479,6 +479,11 @@ async fn run_vpn(
             LoginOutcome::AlreadyConnected { .. } => println!("✅ {name} is already connected."),
             LoginOutcome::Pending { login } => {
                 println!("\n═══ Sign in to {name} ═══\n  {}\n\n{}\n", login.url, login.message);
+                if vpn.supports_paste_back(&name) {
+                    println!("If the browser ends on a http://localhost:... page that fails to load,");
+                    println!("paste that full address here and press Enter.");
+                    spawn_paste_back_reader(vpn.clone(), name.clone());
+                }
                 println!("Waiting for sign-in...");
                 // The background task clears `login` once the command exits or times out.
                 while vpn.status(&name).is_some_and(|s| s.login.is_some()) {
@@ -494,4 +499,20 @@ async fn run_vpn(
         },
     }
     Ok(())
+}
+
+/// Read pasted localhost callback addresses from stdin during `vpn login`.
+fn spawn_paste_back_reader(vpn: Arc<VpnManager>, name: String) {
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            match vpn.complete_login(&name, line).await {
+                Ok(status) => println!("Callback delivered ({status})."),
+                Err(e) => println!("❌ {e}"),
+            }
+        }
+    });
 }

@@ -22,6 +22,7 @@ const DEFAULT_CALL_TIMEOUT_SECS: u64 = 30;
 /// Hub-owned tools. The `hub.` namespace is reserved for these.
 const VPN_STATUS_TOOL: &str = "hub.vpn_status";
 const VPN_LOGIN_TOOL: &str = "hub.vpn_login";
+const VPN_LOGIN_COMPLETE_TOOL: &str = "hub.vpn_login_complete";
 
 /// Transport-agnostic MCP request/notification dispatch.
 ///
@@ -239,7 +240,12 @@ impl McpSession {
             "properties": { "vpn": vpn_property },
             "additionalProperties": false,
         });
-        vec![
+        let paste_back: Vec<&String> = self
+            .vpn_tools
+            .iter()
+            .filter(|n| self.vpn.as_ref().is_some_and(|m| m.supports_paste_back(n)))
+            .collect();
+        let mut tools = vec![
             serde_json::json!({
                 "name": VPN_STATUS_TOOL,
                 "description": "Check VPN connection state (connected / needs_login / down), \
@@ -254,17 +260,48 @@ impl McpSession {
                     anywhere else. Then poll hub.vpn_status until the state is 'connected'.",
                 "inputSchema": schema,
             }),
-        ]
+        ];
+        if !paste_back.is_empty() {
+            tools.push(serde_json::json!({
+                "name": VPN_LOGIN_COMPLETE_TOOL,
+                "description": "Finish a VPN login whose browser redirect ended on a \
+                    http://localhost:<port>/... page that failed to load. Pass the full address \
+                    the user copied from their browser's address bar. Only works while a login \
+                    started by hub.vpn_login is waiting.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "vpn": {
+                            "type": "string",
+                            "enum": paste_back,
+                            "description": "Which VPN. Optional when only one is configured.",
+                        },
+                        "callback_url": {
+                            "type": "string",
+                            "description": "The full http://localhost:<port>/... address.",
+                        },
+                    },
+                    "required": ["callback_url"],
+                    "additionalProperties": false,
+                },
+            }));
+        }
+        tools
     }
 
     /// Handles `hub.*` tools. `None` = not a hub tool on this session.
     async fn call_hub_tool(&self, params: &ToolCallParams) -> Option<Result<Value, String>> {
         let is_status = params.name == VPN_STATUS_TOOL;
         let is_login = params.name == VPN_LOGIN_TOOL;
-        if !(is_status || is_login) || self.vpn_tools.is_empty() {
+        let is_complete = params.name == VPN_LOGIN_COMPLETE_TOOL;
+        if !(is_status || is_login || is_complete) || self.vpn_tools.is_empty() {
             return None;
         }
         let manager = self.vpn.as_ref()?;
+
+        if is_complete {
+            return Some(self.complete_login(manager, params.arguments.as_ref()).await);
+        }
 
         let requested = match self.parse_vpn_arg(params.arguments.as_ref()) {
             Ok(v) => v,
@@ -302,7 +339,7 @@ impl McpSession {
                 serde_json::json!({ "result": "already_connected", "status": status }),
             )),
             Ok(LoginOutcome::Pending { login }) => {
-                let text = format!(
+                let mut text = format!(
                     "Login link for VPN '{name}': {url}\n\n{message}\n\n\
                      Show this link to the user and ask them to sign in. Do not open or share it \
                      anywhere else. The login stays open for {mins} minutes. Afterwards call \
@@ -311,6 +348,13 @@ impl McpSession {
                     message = login.message,
                     mins = login.timeout_at_unix.saturating_sub(login.started_at_unix) / 60,
                 );
+                if manager.supports_paste_back(&name) {
+                    text.push_str(&format!(
+                        " If the browser ends on a http://localhost:... page that does not load, \
+                         ask the user to copy that full address and pass it to \
+                         {VPN_LOGIN_COMPLETE_TOOL}."
+                    ));
+                }
                 Ok(make_text_result(
                     text,
                     serde_json::json!({ "result": "pending", "login": login }),
@@ -318,6 +362,39 @@ impl McpSession {
             }
             Err(e) => Err(e.to_string()),
         })
+    }
+
+    async fn complete_login(
+        &self,
+        manager: &Arc<VpnManager>,
+        arguments: Option<&Value>,
+    ) -> Result<Value, String> {
+        let Some(Value::Object(obj)) = arguments else {
+            return Err("arguments must include 'callback_url'".into());
+        };
+        if let Some(extra) = obj.keys().find(|k| !matches!(k.as_str(), "vpn" | "callback_url")) {
+            return Err(format!("unexpected argument '{extra}'"));
+        }
+        let callback_url = obj
+            .get("callback_url")
+            .and_then(Value::as_str)
+            .ok_or("argument 'callback_url' must be a string")?;
+        let mut vpn_only = obj.clone();
+        vpn_only.remove("callback_url");
+        let name = self
+            .parse_vpn_arg(Some(&Value::Object(vpn_only)))?
+            .ok_or_else(|| format!("argument 'vpn' is required; one of: {}", self.vpn_tools.join(", ")))?;
+        let status = manager
+            .complete_login(&name, callback_url)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(make_text_result(
+            format!(
+                "Callback delivered to the '{name}' login ({status}). Poll {VPN_STATUS_TOOL} \
+                 until the state is 'connected', then retry the original tool."
+            ),
+            serde_json::json!({ "result": "delivered", "http_status": status }),
+        ))
     }
 
     /// Accepts only `{}` or `{"vpn": "<exposed name>"}`; nothing else.
@@ -593,6 +670,7 @@ mod tests {
             command_timeout_secs: 5,
             url_wait_secs: 5,
             login_timeout_secs: 5,
+            callback_ports: vec![],
         }
     }
 
