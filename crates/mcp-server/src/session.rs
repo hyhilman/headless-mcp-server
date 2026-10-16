@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use headless_mcp_registry::BackendRegistry;
-use headless_mcp_vpn::{LoginOutcome, VpnManager, VpnState};
+use headless_mcp_vpn::VpnManager;
 use headless_mcp_wire::{
     JsonRpcError, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
     JsonRpcSuccessResponse,
@@ -12,17 +12,24 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::audit::{AuditEvent, AuditLogger, AuditOutcome};
+use crate::protocol::{
+    mark_complete, RequestCtx, LEGACY_PROTOCOL_VERSION, META_SERVER_INFO,
+    MODERN_PROTOCOL_VERSIONS,
+};
 
-/// A placeholder protocol version string.
-pub const PROTOCOL_VERSION: &str = "2025-06-18";
+/// Version reported to legacy (`initialize`-based) clients.
+pub const PROTOCOL_VERSION: &str = LEGACY_PROTOCOL_VERSION;
+
+/// Guidance for the model, sent in `initialize` / `server/discover`.
+const INSTRUCTIONS: &str = "headless-mcp aggregates several MCP servers; tool names are \
+prefixed with their backend namespace. Some backends need a VPN or SSO login. If a tool \
+returns VPN_REQUIRED, do not retry blindly: follow the instructions in the error (get the \
+login link with hub.vpn_login, show it to the user, wait until hub.vpn_status reports \
+'connected', then retry). Never open, fetch, or forward login links yourself.";
 
 /// Default timeout for tools/call routed to a backend.
 const DEFAULT_CALL_TIMEOUT_SECS: u64 = 30;
 
-/// Hub-owned tools. The `hub.` namespace is reserved for these.
-const VPN_STATUS_TOOL: &str = "hub.vpn_status";
-const VPN_LOGIN_TOOL: &str = "hub.vpn_login";
-const VPN_LOGIN_COMPLETE_TOOL: &str = "hub.vpn_login_complete";
 
 /// Transport-agnostic MCP request/notification dispatch.
 ///
@@ -31,12 +38,12 @@ const VPN_LOGIN_COMPLETE_TOOL: &str = "hub.vpn_login_complete";
 /// [`JsonRpcMessage`], decide what happens and what (if anything) to
 /// send back.
 pub struct McpSession {
-    registry: Arc<BackendRegistry>,
+    pub(crate) registry: Arc<BackendRegistry>,
     audit: Arc<dyn AuditLogger>,
     initialized: AtomicBool,
-    vpn: Option<Arc<VpnManager>>,
+    pub(crate) vpn: Option<Arc<VpnManager>>,
     /// VPN names this session exposes through the `hub.vpn_*` tools.
-    vpn_tools: Vec<String>,
+    pub(crate) vpn_tools: Vec<String>,
 }
 
 impl McpSession {
@@ -105,26 +112,53 @@ impl McpSession {
         &self,
         request: &JsonRpcRequest,
     ) -> (Result<Value, JsonRpcError>, Option<String>, AuditOutcome) {
-        match request.method.as_str() {
-            "initialize" => {
-                let result = self.handle_initialize();
-                let outcome = AuditOutcome::from_result(&result);
-                (result, None, outcome)
-            }
-            "tools/list" => {
-                let result = self.handle_tools_list();
-                let outcome = AuditOutcome::from_result(&result);
-                (result, None, outcome)
-            }
-            "tools/call" => self.handle_tools_call(request.params.clone()).await,
-            other => {
-                let result = Err(JsonRpcError::method_not_found(format!(
-                    "unknown method: {other}"
-                )));
-                let outcome = AuditOutcome::from_result(&result);
-                (result, None, outcome)
+        let ctx = RequestCtx::from_params(request.params.as_ref());
+        if let Err(err) = ctx.check_version() {
+            let outcome = AuditOutcome::Error { code: err.code };
+            return (Err(err), None, outcome);
+        }
+
+        let (mut result, tool_name, outcome) = match request.method.as_str() {
+            "server/discover" => self.simple(Ok(self.handle_discover())),
+            "initialize" if !ctx.is_modern() => self.simple(self.handle_initialize()),
+            "tools/list" => self.simple(self.handle_tools_list(&ctx)),
+            "tools/call" => self.handle_tools_call(request.params.clone(), &ctx).await,
+            other => self.simple(Err(JsonRpcError::method_not_found(format!(
+                "unknown method: {other}"
+            )))),
+        };
+        if ctx.is_modern() {
+            if let Ok(value) = &mut result {
+                mark_complete(value);
             }
         }
+        (result, tool_name, outcome)
+    }
+
+    fn simple(
+        &self,
+        result: Result<Value, JsonRpcError>,
+    ) -> (Result<Value, JsonRpcError>, Option<String>, AuditOutcome) {
+        let outcome = AuditOutcome::from_result(&result);
+        (result, None, outcome)
+    }
+
+    fn capabilities(&self) -> Value {
+        serde_json::json!({ "tools": { "listChanged": false } })
+    }
+
+    fn handle_discover(&self) -> Value {
+        serde_json::json!({
+            "supportedVersions": MODERN_PROTOCOL_VERSIONS,
+            "capabilities": self.capabilities(),
+            "_meta": {
+                META_SERVER_INFO: {
+                    "name": "headless-mcp",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+            "instructions": INSTRUCTIONS,
+        })
     }
 
     fn handle_initialize(&self) -> Result<Value, JsonRpcError> {
@@ -135,12 +169,14 @@ impl McpSession {
                 "name": "headless-mcp",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "capabilities": { "tools": {} },
+            "capabilities": self.capabilities(),
+            "instructions": INSTRUCTIONS,
         }))
     }
 
-    fn require_initialized(&self) -> Result<(), JsonRpcError> {
-        if self.initialized.load(Ordering::SeqCst) {
+    /// Legacy requests need `initialize` first; modern requests are stateless.
+    fn require_initialized(&self, ctx: &RequestCtx) -> Result<(), JsonRpcError> {
+        if ctx.is_modern() || self.initialized.load(Ordering::SeqCst) {
             Ok(())
         } else {
             Err(JsonRpcError::invalid_request(
@@ -149,8 +185,8 @@ impl McpSession {
         }
     }
 
-    fn handle_tools_list(&self) -> Result<Value, JsonRpcError> {
-        self.require_initialized()?;
+    fn handle_tools_list(&self, ctx: &RequestCtx) -> Result<Value, JsonRpcError> {
+        self.require_initialized(ctx)?;
         let mut tools = serde_json::to_value(self.registry.aggregated_tools())
             .unwrap_or_else(|_| Value::Array(Vec::new()));
         if let Value::Array(list) = &mut tools {
@@ -162,8 +198,9 @@ impl McpSession {
     async fn handle_tools_call(
         &self,
         params: Option<Value>,
+        ctx: &RequestCtx,
     ) -> (Result<Value, JsonRpcError>, Option<String>, AuditOutcome) {
-        if let Err(err) = self.require_initialized() {
+        if let Err(err) = self.require_initialized(ctx) {
             let outcome = AuditOutcome::Error { code: err.code };
             return (Err(err), None, outcome);
         }
@@ -224,263 +261,6 @@ impl McpSession {
         }
     }
 
-    // ── hub VPN tools ──────────────────────────────────────────────────
-
-    fn hub_tool_descriptors(&self) -> Vec<Value> {
-        if self.vpn_tools.is_empty() {
-            return Vec::new();
-        }
-        let vpn_property = serde_json::json!({
-            "type": "string",
-            "enum": self.vpn_tools,
-            "description": "Which VPN. Optional when only one is configured.",
-        });
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": { "vpn": vpn_property },
-            "additionalProperties": false,
-        });
-        let paste_back: Vec<&String> = self
-            .vpn_tools
-            .iter()
-            .filter(|n| self.vpn.as_ref().is_some_and(|m| m.supports_paste_back(n)))
-            .collect();
-        let mut tools = vec![
-            serde_json::json!({
-                "name": VPN_STATUS_TOOL,
-                "description": "Check VPN connection state (connected / needs_login / down), \
-                    login expiry, and any login waiting for the user. Some backends only work \
-                    while their VPN is connected.",
-                "inputSchema": schema,
-            }),
-            serde_json::json!({
-                "name": VPN_LOGIN_TOOL,
-                "description": "Start the VPN's SSO login and return the login link. Show the \
-                    link to the user and ask them to sign in; do not open, fetch, or share it \
-                    anywhere else. Then poll hub.vpn_status until the state is 'connected'.",
-                "inputSchema": schema,
-            }),
-        ];
-        if !paste_back.is_empty() {
-            tools.push(serde_json::json!({
-                "name": VPN_LOGIN_COMPLETE_TOOL,
-                "description": "Finish a VPN login whose browser redirect ended on a \
-                    http://localhost:<port>/... page that failed to load. Pass the full address \
-                    the user copied from their browser's address bar. Only works while a login \
-                    started by hub.vpn_login is waiting.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "vpn": {
-                            "type": "string",
-                            "enum": paste_back,
-                            "description": "Which VPN. Optional when only one is configured.",
-                        },
-                        "callback_url": {
-                            "type": "string",
-                            "description": "The full http://localhost:<port>/... address.",
-                        },
-                    },
-                    "required": ["callback_url"],
-                    "additionalProperties": false,
-                },
-            }));
-        }
-        tools
-    }
-
-    /// Handles `hub.*` tools. `None` = not a hub tool on this session.
-    async fn call_hub_tool(&self, params: &ToolCallParams) -> Option<Result<Value, String>> {
-        let is_status = params.name == VPN_STATUS_TOOL;
-        let is_login = params.name == VPN_LOGIN_TOOL;
-        let is_complete = params.name == VPN_LOGIN_COMPLETE_TOOL;
-        if !(is_status || is_login || is_complete) || self.vpn_tools.is_empty() {
-            return None;
-        }
-        let manager = self.vpn.as_ref()?;
-
-        if is_complete {
-            return Some(self.complete_login(manager, params.arguments.as_ref()).await);
-        }
-
-        let requested = match self.parse_vpn_arg(params.arguments.as_ref()) {
-            Ok(v) => v,
-            Err(e) => return Some(Err(e)),
-        };
-
-        if is_status {
-            let names = match requested {
-                Some(name) => vec![name],
-                None => self.vpn_tools.clone(),
-            };
-            let mut statuses = Vec::new();
-            for name in names {
-                match manager.refresh(&name).await {
-                    Ok(status) => statuses.push(status),
-                    Err(e) => return Some(Err(e.to_string())),
-                }
-            }
-            let value = serde_json::json!({ "vpns": statuses });
-            return Some(Ok(make_success_result(value)));
-        }
-
-        let name = match requested {
-            Some(name) => name,
-            None => {
-                return Some(Err(format!(
-                    "argument 'vpn' is required; one of: {}",
-                    self.vpn_tools.join(", ")
-                )))
-            }
-        };
-        Some(match manager.start_login(&name).await {
-            Ok(LoginOutcome::AlreadyConnected { status }) => Ok(make_text_result(
-                format!("VPN '{name}' is already connected. Retry the original tool."),
-                serde_json::json!({ "result": "already_connected", "status": status }),
-            )),
-            Ok(LoginOutcome::Pending { login }) => {
-                let mut text = format!(
-                    "Login link for VPN '{name}': {url}\n\n{message}\n\n\
-                     Show this link to the user and ask them to sign in. Do not open or share it \
-                     anywhere else. The login stays open for {mins} minutes. Afterwards call \
-                     {VPN_STATUS_TOOL} until the state is 'connected', then retry the original tool.",
-                    url = login.url,
-                    message = login.message,
-                    mins = login.timeout_at_unix.saturating_sub(login.started_at_unix) / 60,
-                );
-                if manager.supports_paste_back(&name) {
-                    text.push_str(&format!(
-                        " If the browser ends on a http://localhost:... page that does not load, \
-                         ask the user to copy that full address and pass it to \
-                         {VPN_LOGIN_COMPLETE_TOOL}."
-                    ));
-                }
-                Ok(make_text_result(
-                    text,
-                    serde_json::json!({ "result": "pending", "login": login }),
-                ))
-            }
-            Err(e) => Err(e.to_string()),
-        })
-    }
-
-    async fn complete_login(
-        &self,
-        manager: &Arc<VpnManager>,
-        arguments: Option<&Value>,
-    ) -> Result<Value, String> {
-        let Some(Value::Object(obj)) = arguments else {
-            return Err("arguments must include 'callback_url'".into());
-        };
-        if let Some(extra) = obj.keys().find(|k| !matches!(k.as_str(), "vpn" | "callback_url")) {
-            return Err(format!("unexpected argument '{extra}'"));
-        }
-        let callback_url = obj
-            .get("callback_url")
-            .and_then(Value::as_str)
-            .ok_or("argument 'callback_url' must be a string")?;
-        let mut vpn_only = obj.clone();
-        vpn_only.remove("callback_url");
-        let name = self
-            .parse_vpn_arg(Some(&Value::Object(vpn_only)))?
-            .ok_or_else(|| format!("argument 'vpn' is required; one of: {}", self.vpn_tools.join(", ")))?;
-        let status = manager
-            .complete_login(&name, callback_url)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(make_text_result(
-            format!(
-                "Callback delivered to the '{name}' login ({status}). Poll {VPN_STATUS_TOOL} \
-                 until the state is 'connected', then retry the original tool."
-            ),
-            serde_json::json!({ "result": "delivered", "http_status": status }),
-        ))
-    }
-
-    /// Accepts only `{}` or `{"vpn": "<exposed name>"}`; nothing else.
-    fn parse_vpn_arg(&self, arguments: Option<&Value>) -> Result<Option<String>, String> {
-        let obj = match arguments {
-            None | Some(Value::Null) => return Ok(self.default_vpn()),
-            Some(Value::Object(obj)) => obj,
-            Some(_) => return Err("arguments must be an object".into()),
-        };
-        if let Some(extra) = obj.keys().find(|k| k.as_str() != "vpn") {
-            return Err(format!("unexpected argument '{extra}'; only 'vpn' is accepted"));
-        }
-        match obj.get("vpn") {
-            None | Some(Value::Null) => Ok(self.default_vpn()),
-            Some(Value::String(name)) if self.vpn_tools.contains(name) => Ok(Some(name.clone())),
-            Some(_) => Err(format!(
-                "unknown VPN; expected one of: {}",
-                self.vpn_tools.join(", ")
-            )),
-        }
-    }
-
-    fn default_vpn(&self) -> Option<String> {
-        match self.vpn_tools.as_slice() {
-            [only] => Some(only.clone()),
-            _ => None,
-        }
-    }
-
-    /// Returns an actionable error if the tool's backend needs a VPN that
-    /// is known to be down. `Unknown` (not checked yet) is let through.
-    fn vpn_gate(&self, tool: &str) -> Option<String> {
-        let manager = self.vpn.as_ref()?;
-        let (backend_id, required) = self.registry.tool_requirements(tool)?;
-        for name in required {
-            let status = manager.status(&name)?;
-            if matches!(status.state, VpnState::Connected | VpnState::Unknown) {
-                continue;
-            }
-            let mut message = format!(
-                "VPN_REQUIRED: backend '{backend_id}' needs VPN '{name}', which is {state}.",
-                state = status.state,
-            );
-            message.push(' ');
-            message.push_str(&self.login_instructions(&name, status.login.is_some()));
-            return Some(message);
-        }
-        None
-    }
-
-    /// Hint for "no such tool": tools behind a down VPN are not listed.
-    fn vpn_hint(&self) -> Option<String> {
-        let manager = self.vpn.as_ref()?;
-        let down: Vec<String> = manager
-            .names()
-            .into_iter()
-            .filter_map(|n| manager.status(&n))
-            .filter(|s| matches!(s.state, VpnState::NeedsLogin | VpnState::Down))
-            .map(|s| format!("'{}' ({})", s.name, s.state))
-            .collect();
-        if down.is_empty() {
-            return None;
-        }
-        Some(format!(
-            "Note: VPN {} is not connected; tools behind it are unavailable until it reconnects.",
-            down.join(", ")
-        ))
-    }
-
-    fn login_instructions(&self, vpn: &str, pending: bool) -> String {
-        if !self.vpn_tools.iter().any(|n| n == vpn) {
-            return format!("Ask the user to log in to VPN '{vpn}' on the hub host, then retry.");
-        }
-        if pending {
-            format!(
-                "A login is already waiting for the user: call {VPN_LOGIN_TOOL} {{\"vpn\":\"{vpn}\"}} \
-                 to get the link again, then poll {VPN_STATUS_TOOL} and retry once connected."
-            )
-        } else {
-            format!(
-                "Call {VPN_LOGIN_TOOL} {{\"vpn\":\"{vpn}\"}}, show the returned link to the user, \
-                 poll {VPN_STATUS_TOOL} until the state is 'connected', then retry this tool."
-            )
-        }
-    }
-
     fn handle_notification(&self, notification: JsonRpcNotification) {
         match notification.method.as_str() {
             "notifications/initialized" => {
@@ -494,13 +274,13 @@ impl McpSession {
 }
 
 #[derive(Debug, Deserialize)]
-struct ToolCallParams {
-    name: String,
+pub(crate) struct ToolCallParams {
+    pub(crate) name: String,
     #[serde(default)]
-    arguments: Option<Value>,
+    pub(crate) arguments: Option<Value>,
 }
 
-fn make_success_result(value: Value) -> Value {
+pub(crate) fn make_success_result(value: Value) -> Value {
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     serde_json::json!({
         "content": [
@@ -511,7 +291,7 @@ fn make_success_result(value: Value) -> Value {
     })
 }
 
-fn make_text_result(text: String, structured: Value) -> Value {
+pub(crate) fn make_text_result(text: String, structured: Value) -> Value {
     serde_json::json!({
         "content": [
             { "type": "text", "text": text }
@@ -521,7 +301,7 @@ fn make_text_result(text: String, structured: Value) -> Value {
     })
 }
 
-fn make_error_result(message: String) -> Value {
+pub(crate) fn make_error_result(message: String) -> Value {
     serde_json::json!({
         "content": [
             { "type": "text", "text": message }
@@ -621,12 +401,65 @@ mod tests {
         assert_eq!(err.error.code, JsonRpcError::METHOD_NOT_FOUND);
     }
 
+    // ── 2026-07-28 protocol ────────────────────────────────────────────
+
+    fn modern_params(extra: Value) -> Value {
+        let mut params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        if let (Value::Object(p), Value::Object(e)) = (&mut params, extra) {
+            p.extend(e);
+        }
+        params
+    }
+
+    #[tokio::test]
+    async fn discover_lists_modern_version() {
+        let session = McpSession::new(Arc::new(BackendRegistry::new()), Arc::new(TracingAuditLogger));
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(1, "server/discover", Some(modern_params(serde_json::json!({}))))))
+            .await
+            .unwrap();
+        let JsonRpcMessage::SuccessResponse(ok) = reply else { panic!("{reply:?}") };
+        assert_eq!(ok.result["supportedVersions"], serde_json::json!(["2026-07-28"]));
+        assert_eq!(ok.result["resultType"], "complete");
+        assert!(ok.result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"].is_string());
+    }
+
+    #[tokio::test]
+    async fn modern_requests_need_no_initialize() {
+        let session = McpSession::new(Arc::new(BackendRegistry::new()), Arc::new(TracingAuditLogger));
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(1, "tools/list", Some(modern_params(serde_json::json!({}))))))
+            .await
+            .unwrap();
+        let JsonRpcMessage::SuccessResponse(ok) = reply else { panic!("{reply:?}") };
+        assert_eq!(ok.result["resultType"], "complete");
+    }
+
+    #[tokio::test]
+    async fn unknown_modern_version_is_rejected_with_supported_list() {
+        let session = McpSession::new(Arc::new(BackendRegistry::new()), Arc::new(TracingAuditLogger));
+        let params = serde_json::json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": "1900-01-01" } });
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(1, "tools/list", Some(params))))
+            .await
+            .unwrap();
+        let JsonRpcMessage::ErrorResponse(err) = reply else { panic!("{reply:?}") };
+        assert_eq!(err.error.code, crate::protocol::UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(err.error.data.unwrap()["supported"], serde_json::json!(["2026-07-28"]));
+    }
+
     // ── VPN ────────────────────────────────────────────────────────────
 
     use headless_mcp_core::{
         BackendDef, BackendResult, BackendTransport, ConnectionMode, InitializeResult,
         McpBackend, ServerCapabilities, ServerInfo, StderrMode, ToolDescriptor,
     };
+    use crate::vpn_tools::{VPN_LOGIN_TOOL, VPN_STATUS_TOOL};
     use headless_mcp_vpn::VpnDef;
     use std::collections::HashMap;
 

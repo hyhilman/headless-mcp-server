@@ -1,0 +1,272 @@
+//! Hub-owned VPN tools (`hub.vpn_status`, `hub.vpn_login`,
+//! `hub.vpn_login_complete`) and the `requires_vpn` call gate.
+
+use std::sync::Arc;
+
+use headless_mcp_vpn::{LoginOutcome, VpnManager, VpnState};
+use serde_json::Value;
+
+use crate::session::{make_success_result, make_text_result, McpSession, ToolCallParams};
+
+/// Hub-owned tools. The `hub.` namespace is reserved for these.
+pub(crate) const VPN_STATUS_TOOL: &str = "hub.vpn_status";
+pub(crate) const VPN_LOGIN_TOOL: &str = "hub.vpn_login";
+pub(crate) const VPN_LOGIN_COMPLETE_TOOL: &str = "hub.vpn_login_complete";
+
+impl McpSession {
+    pub(crate) fn hub_tool_descriptors(&self) -> Vec<Value> {
+        if self.vpn_tools.is_empty() {
+            return Vec::new();
+        }
+        let vpn_property = serde_json::json!({
+            "type": "string",
+            "enum": self.vpn_tools,
+            "description": "Which VPN. Optional when only one is configured.",
+        });
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "vpn": vpn_property },
+            "additionalProperties": false,
+        });
+        let paste_back: Vec<&String> = self
+            .vpn_tools
+            .iter()
+            .filter(|n| self.vpn.as_ref().is_some_and(|m| m.supports_paste_back(n)))
+            .collect();
+        let mut tools = vec![
+            serde_json::json!({
+                "name": VPN_STATUS_TOOL,
+                "description": "Check VPN connection state (connected / needs_login / down), \
+                    login expiry, and any login waiting for the user. Some backends only work \
+                    while their VPN is connected.",
+                "inputSchema": schema,
+            }),
+            serde_json::json!({
+                "name": VPN_LOGIN_TOOL,
+                "description": "Start the VPN's SSO login and return the login link. Show the \
+                    link to the user and ask them to sign in; do not open, fetch, or share it \
+                    anywhere else. Then poll hub.vpn_status until the state is 'connected'.",
+                "inputSchema": schema,
+            }),
+        ];
+        if !paste_back.is_empty() {
+            tools.push(serde_json::json!({
+                "name": VPN_LOGIN_COMPLETE_TOOL,
+                "description": "Finish a VPN login whose browser redirect ended on a \
+                    http://localhost:<port>/... page that failed to load. Pass the full address \
+                    the user copied from their browser's address bar. Only works while a login \
+                    started by hub.vpn_login is waiting.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "vpn": {
+                            "type": "string",
+                            "enum": paste_back,
+                            "description": "Which VPN. Optional when only one is configured.",
+                        },
+                        "callback_url": {
+                            "type": "string",
+                            "description": "The full http://localhost:<port>/... address.",
+                        },
+                    },
+                    "required": ["callback_url"],
+                    "additionalProperties": false,
+                },
+            }));
+        }
+        tools
+    }
+
+    /// Handles `hub.*` tools. `None` = not a hub tool on this session.
+    pub(crate) async fn call_hub_tool(&self, params: &ToolCallParams) -> Option<Result<Value, String>> {
+        let is_status = params.name == VPN_STATUS_TOOL;
+        let is_login = params.name == VPN_LOGIN_TOOL;
+        let is_complete = params.name == VPN_LOGIN_COMPLETE_TOOL;
+        if !(is_status || is_login || is_complete) || self.vpn_tools.is_empty() {
+            return None;
+        }
+        let manager = self.vpn.as_ref()?;
+
+        if is_complete {
+            return Some(self.complete_login(manager, params.arguments.as_ref()).await);
+        }
+
+        let requested = match self.parse_vpn_arg(params.arguments.as_ref()) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+
+        if is_status {
+            let names = match requested {
+                Some(name) => vec![name],
+                None => self.vpn_tools.clone(),
+            };
+            let mut statuses = Vec::new();
+            for name in names {
+                match manager.refresh(&name).await {
+                    Ok(status) => statuses.push(status),
+                    Err(e) => return Some(Err(e.to_string())),
+                }
+            }
+            let value = serde_json::json!({ "vpns": statuses });
+            return Some(Ok(make_success_result(value)));
+        }
+
+        let name = match requested {
+            Some(name) => name,
+            None => {
+                return Some(Err(format!(
+                    "argument 'vpn' is required; one of: {}",
+                    self.vpn_tools.join(", ")
+                )))
+            }
+        };
+        Some(match manager.start_login(&name).await {
+            Ok(LoginOutcome::AlreadyConnected { status }) => Ok(make_text_result(
+                format!("VPN '{name}' is already connected. Retry the original tool."),
+                serde_json::json!({ "result": "already_connected", "status": status }),
+            )),
+            Ok(LoginOutcome::Pending { login }) => {
+                let mut text = format!(
+                    "Login link for VPN '{name}': {url}\n\n{message}\n\n\
+                     Show this link to the user and ask them to sign in. Do not open or share it \
+                     anywhere else. The login stays open for {mins} minutes. Afterwards call \
+                     {VPN_STATUS_TOOL} until the state is 'connected', then retry the original tool.",
+                    url = login.url,
+                    message = login.message,
+                    mins = login.timeout_at_unix.saturating_sub(login.started_at_unix) / 60,
+                );
+                if manager.supports_paste_back(&name) {
+                    text.push_str(&format!(
+                        " If the browser ends on a http://localhost:... page that does not load, \
+                         ask the user to copy that full address and pass it to \
+                         {VPN_LOGIN_COMPLETE_TOOL}."
+                    ));
+                }
+                Ok(make_text_result(
+                    text,
+                    serde_json::json!({ "result": "pending", "login": login }),
+                ))
+            }
+            Err(e) => Err(e.to_string()),
+        })
+    }
+
+    async fn complete_login(
+        &self,
+        manager: &Arc<VpnManager>,
+        arguments: Option<&Value>,
+    ) -> Result<Value, String> {
+        let Some(Value::Object(obj)) = arguments else {
+            return Err("arguments must include 'callback_url'".into());
+        };
+        if let Some(extra) = obj.keys().find(|k| !matches!(k.as_str(), "vpn" | "callback_url")) {
+            return Err(format!("unexpected argument '{extra}'"));
+        }
+        let callback_url = obj
+            .get("callback_url")
+            .and_then(Value::as_str)
+            .ok_or("argument 'callback_url' must be a string")?;
+        let mut vpn_only = obj.clone();
+        vpn_only.remove("callback_url");
+        let name = self
+            .parse_vpn_arg(Some(&Value::Object(vpn_only)))?
+            .ok_or_else(|| format!("argument 'vpn' is required; one of: {}", self.vpn_tools.join(", ")))?;
+        let status = manager
+            .complete_login(&name, callback_url)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(make_text_result(
+            format!(
+                "Callback delivered to the '{name}' login ({status}). Poll {VPN_STATUS_TOOL} \
+                 until the state is 'connected', then retry the original tool."
+            ),
+            serde_json::json!({ "result": "delivered", "http_status": status }),
+        ))
+    }
+
+    /// Accepts only `{}` or `{"vpn": "<exposed name>"}`; nothing else.
+    fn parse_vpn_arg(&self, arguments: Option<&Value>) -> Result<Option<String>, String> {
+        let obj = match arguments {
+            None | Some(Value::Null) => return Ok(self.default_vpn()),
+            Some(Value::Object(obj)) => obj,
+            Some(_) => return Err("arguments must be an object".into()),
+        };
+        if let Some(extra) = obj.keys().find(|k| k.as_str() != "vpn") {
+            return Err(format!("unexpected argument '{extra}'; only 'vpn' is accepted"));
+        }
+        match obj.get("vpn") {
+            None | Some(Value::Null) => Ok(self.default_vpn()),
+            Some(Value::String(name)) if self.vpn_tools.contains(name) => Ok(Some(name.clone())),
+            Some(_) => Err(format!(
+                "unknown VPN; expected one of: {}",
+                self.vpn_tools.join(", ")
+            )),
+        }
+    }
+
+    fn default_vpn(&self) -> Option<String> {
+        match self.vpn_tools.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns an actionable error if the tool's backend needs a VPN that
+    /// is known to be down. `Unknown` (not checked yet) is let through.
+    pub(crate) fn vpn_gate(&self, tool: &str) -> Option<String> {
+        let manager = self.vpn.as_ref()?;
+        let (backend_id, required) = self.registry.tool_requirements(tool)?;
+        for name in required {
+            let status = manager.status(&name)?;
+            if matches!(status.state, VpnState::Connected | VpnState::Unknown) {
+                continue;
+            }
+            let mut message = format!(
+                "VPN_REQUIRED: backend '{backend_id}' needs VPN '{name}', which is {state}.",
+                state = status.state,
+            );
+            message.push(' ');
+            message.push_str(&self.login_instructions(&name, status.login.is_some()));
+            return Some(message);
+        }
+        None
+    }
+
+    /// Hint for "no such tool": tools behind a down VPN are not listed.
+    pub(crate) fn vpn_hint(&self) -> Option<String> {
+        let manager = self.vpn.as_ref()?;
+        let down: Vec<String> = manager
+            .names()
+            .into_iter()
+            .filter_map(|n| manager.status(&n))
+            .filter(|s| matches!(s.state, VpnState::NeedsLogin | VpnState::Down))
+            .map(|s| format!("'{}' ({})", s.name, s.state))
+            .collect();
+        if down.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Note: VPN {} is not connected; tools behind it are unavailable until it reconnects.",
+            down.join(", ")
+        ))
+    }
+
+    pub(crate) fn login_instructions(&self, vpn: &str, pending: bool) -> String {
+        if !self.vpn_tools.iter().any(|n| n == vpn) {
+            return format!("Ask the user to log in to VPN '{vpn}' on the hub host, then retry.");
+        }
+        if pending {
+            format!(
+                "A login is already waiting for the user: call {VPN_LOGIN_TOOL} {{\"vpn\":\"{vpn}\"}} \
+                 to get the link again, then poll {VPN_STATUS_TOOL} and retry once connected."
+            )
+        } else {
+            format!(
+                "Call {VPN_LOGIN_TOOL} {{\"vpn\":\"{vpn}\"}}, show the returned link to the user, \
+                 poll {VPN_STATUS_TOOL} until the state is 'connected', then retry this tool."
+            )
+        }
+    }
+
+}
