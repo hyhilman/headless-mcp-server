@@ -216,14 +216,87 @@ Check the output strings against your NetBird version (`netbird status`).
   as soon as it is printed, and keeps the command running in the background
   until you finish signing in (`login_timeout_secs`, default 600). A second call
   while a login is waiting returns the same link instead of starting another.
-- **Blocked calls** to a backend with `requires_vpn` return an error telling the
-  agent to call `hub.vpn_login`, show you the link, and retry once connected.
+- **Blocked calls** to a backend with `requires_vpn`:
+  - Clients on MCP 2026-07-28 that support URL elicitation get the login link
+    shown to the user directly (not to the model). Their retry waits up to 20s
+    for the login, then runs the tool.
+  - Other clients get a `VPN_REQUIRED` error telling the agent to call
+    `hub.vpn_login`, show you the link, and retry once connected.
 - **When the VPN comes back**, backends that require it reconnect automatically.
 - **Expose blocks** only get the `hub.vpn_*` tools if they list the VPN:
   `vpn = ["netbird"]` under `[[expose]]`. Without expose blocks, all VPNs are exposed.
 - **From a terminal:** `headless-mcp vpn status` and `headless-mcp vpn login netbird`.
+- **Watch for changes:** the state is readable as the resource `hub://vpn/<name>`.
+  MCP 2026-07-28 clients can `subscriptions/listen` to it and to
+  `toolsListChanged` (sent after backends reconnect).
 
 The `hub.` tool namespace is reserved for these tools.
+
+**Login redirects to `localhost`.** If the login sends the browser to
+`http://localhost:<port>/...` and the hub runs elsewhere, that page fails to
+load. List the ports, then paste the address from the browser's address bar
+into `headless-mcp vpn login netbird`, or have the agent pass it to
+`hub.vpn_login_complete`:
+
+```toml
+[vpn.netbird]
+callback_ports = [53000, 54000]   # only http://localhost on these ports, only while a login is waiting
+```
+
+**Alerts.** Get told when a VPN needs login, goes down, or comes back:
+
+```toml
+[[notify]]
+kind = "slack"                     # or "webhook" (JSON) or "ntfy"
+url = "{{env:SLACK_WEBHOOK_URL}}"
+on = ["needs_login", "down", "connected"]   # default: all three
+
+[vpn.netbird]
+auto_login = true                  # start the login right away; the alert carries the link
+```
+
+**MCP Events** (as used by ChatGPT): clients can subscribe to
+`vpn.state_changed` and receive signed webhooks
+([Standard Webhooks](https://www.standardwebhooks.com/)).
+
+```toml
+[events]
+enabled = true
+# include_login_url = false        # put the pending login link in payloads
+# default_ttl_secs = 86400
+# max_ttl_secs = 604800
+# allow_insecure_callbacks = false # testing only: allow http:// and private addresses
+```
+
+Callbacks must be HTTPS to a public address (checked at connect time, no
+redirects) and pass a signed challenge before any event is sent.
+Subscriptions are saved to `$HEADLESS_MCP_DATA_DIR/events.json` (mode 0600;
+it contains the signing secrets).
+
+**AWS SSO and other CLI logins** work the same way. A `[vpn.<name>]` section is
+just "a session with health and login commands":
+
+```toml
+[vpn.aws-prod]
+health = ["aws", "sts", "get-caller-identity", "--profile", "prod"]
+needs_login_if = ["Token has expired", "SSO session", "expired"]
+login = ["aws", "sso", "login", "--profile", "prod", "--use-device-code", "--no-browser"]
+
+[backends.aws]
+transport = "stdio"
+command = "uvx"
+args = ["mcp-proxy-for-aws==1.6.2", "https://aws-mcp.us-east-1.api.aws/mcp", "--profile", "prod"]
+requires_vpn = ["aws-prod"]
+pin_args = { profile = "prod" }    # agents can't switch profile
+deny_args = ["account_id"]         # calls passing this are rejected
+```
+
+### Protocol versions
+
+The hub speaks MCP 2026-07-28 (`server/discover`, version in every request's
+`_meta`, `resultType`, `subscriptions/listen`, multi round-trip requests)
+alongside older versions (`initialize` handshake). Over HTTP, modern requests
+must send a matching `MCP-Protocol-Version` header.
 
 ## Config reference
 
@@ -252,6 +325,8 @@ The `hub.` tool namespace is reserved for these tools.
 | `call_timeout_secs` | Timeout for each tool call (default: 30) |
 | `stderr_mode` | `"log-on-error"`, `"silent"`, `"passthrough"`, `"log-always"` |
 | `requires_vpn` | VPN names (`[vpn.<name>]`) that must be connected before calls are forwarded |
+| `pin_args` | Table of tool arguments always set by the hub (caller values are overwritten; hidden from schemas) |
+| `deny_args` | Tool arguments callers may not send (calls are rejected; hidden from schemas) |
 
 ### VPN options
 
@@ -269,6 +344,8 @@ Under `[vpn.<name>]` (unknown keys are rejected):
 | `command_timeout_secs` | Timeout for `health`/`expiry` (default 15) |
 | `url_wait_secs` | How long to wait for the link to appear (default 30) |
 | `login_timeout_secs` | How long the login may wait for the user (default 600) |
+| `callback_ports` | Ports for pasting back a `http://localhost` redirect (empty = off) |
+| `auto_login` | Start the login as soon as it is needed; alerts carry the link |
 
 ### OAuth2 options
 
@@ -294,6 +371,7 @@ COMMANDS:
   config              Print the resolved config
   vpn [status [<name>] | login <name>]
                       Check VPN state, or print the SSO link and wait for login
+                      (paste a localhost redirect address while waiting)
   serve               Start the hub daemon
 
   serve OPTIONS:

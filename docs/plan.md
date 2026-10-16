@@ -30,3 +30,12 @@ without the agent being able to change what the hub runs.
 - **`requestState` is HMAC-signed** with a per-process key and expires.
 - **Event callbacks** must be HTTPS to public addresses (resolved and pinned),
   with Standard Webhooks signatures.
+- **Single principal.** The hub has one bearer token, so event subscription ids
+  and `requestState` are not bound to a per-user identity.
+- **Backends whose VPN was down at startup** never listed tools; calls to
+  `<namespace>.*` still hit the VPN gate, and the backend reconnects after login.
+
+## Found along the way
+
+- Stdio backends were killed right after connecting (`kill_on_drop` on a
+  dropped `Child`), so they exposed no tools. Fixed.

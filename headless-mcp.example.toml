@@ -53,8 +53,20 @@ callback_port = 9799
 # needs_login_if = ["NeedsLogin", "SessionExpired", "LoginFailed"]
 # login = ["netbird", "up"]
 #
+# callback_ports = [53000, 54000]   # paste-back for localhost redirects
+# auto_login = true                 # start login when needed; alerts carry the link
+#
 # Then on any backend reachable only over the VPN:
 # requires_vpn = ["netbird"]
+# pin_args = { profile = "prod" }   # agents can't change these arguments
+# deny_args = ["account_id"]
+
+# [[notify]]
+# kind = "slack"                    # or "webhook", "ntfy"
+# url = "{{env:SLACK_WEBHOOK_URL}}"
+
+# [events]
+# enabled = true                    # MCP Events: signed webhooks on VPN state changes
 
 # ── Expose: Read-only (port 9797) ───────────────────────────────────────
 [[expose]]
