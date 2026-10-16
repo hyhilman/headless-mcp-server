@@ -700,6 +700,7 @@ name = "headless-mcp-transport-http"
 version = "0.0.8"
 dependencies = [
  "axum",
+ "futures-util",
  "governor",
  "headless-mcp-server",
  "headless-mcp-wire",

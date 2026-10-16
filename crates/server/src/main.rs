@@ -192,10 +192,10 @@ async fn run_serve(
             for (id, r) in &reg.connect_all().await {
                 if let Err(e) = r { tracing::warn!(%id, %label, %e, "connect failed"); }
             }
-            spawn_vpn_reconnect(&vpn, reg.clone());
             let session = Arc::new(
-                McpSession::new(reg, Arc::new(TracingAuditLogger)).with_vpn(vpn.clone(), eb.vpn.clone()),
+                McpSession::new(reg.clone(), Arc::new(TracingAuditLogger)).with_vpn(vpn.clone(), eb.vpn.clone()),
             );
+            spawn_vpn_reconnect(&vpn, reg, session.clone());
             let token = hub_token.clone();
             tracing::info!(%label, %addr, "starting expose");
             handles.push(tokio::spawn(async move {
@@ -220,10 +220,10 @@ async fn run_serve(
     for (id, r) in &reg.connect_all().await {
         if let Err(e) = r { tracing::warn!(%id, %e, "connect failed"); }
     }
-    spawn_vpn_reconnect(&vpn, reg.clone());
     let session = Arc::new(
-        McpSession::new(reg, Arc::new(TracingAuditLogger)).with_vpn(vpn.clone(), vpn.names()),
+        McpSession::new(reg.clone(), Arc::new(TracingAuditLogger)).with_vpn(vpn.clone(), vpn.names()),
     );
+    spawn_vpn_reconnect(&vpn, reg, session.clone());
     if http {
         let token = cfg.auth.as_ref().and_then(|a| a.hub_token.clone())
             .unwrap_or_else(|| std::env::var("HEADLESS_MCP_TOKEN").unwrap_or_default());
@@ -239,7 +239,7 @@ async fn run_serve(
 }
 
 /// When a VPN comes back after being down, reconnect the backends behind it.
-fn spawn_vpn_reconnect(vpn: &Arc<VpnManager>, reg: Arc<BackendRegistry>) {
+fn spawn_vpn_reconnect(vpn: &Arc<VpnManager>, reg: Arc<BackendRegistry>, session: Arc<McpSession>) {
     if vpn.is_empty() { return; }
     let mut events = vpn.subscribe();
     tokio::spawn(async move {
@@ -251,11 +251,15 @@ fn spawn_vpn_reconnect(vpn: &Arc<VpnManager>, reg: Arc<BackendRegistry>) {
             };
             match to {
                 VpnState::Connected if matches!(from, VpnState::NeedsLogin | VpnState::Down) => {
-                    for id in reg.backends_requiring_vpn(&name) {
-                        match reg.reconnect_backend(&id).await {
+                    let ids = reg.backends_requiring_vpn(&name);
+                    for id in &ids {
+                        match reg.reconnect_backend(id).await {
                             Ok(()) => tracing::info!(%id, vpn = %name, "backend reconnected after VPN login"),
                             Err(e) => tracing::warn!(%id, vpn = %name, %e, "reconnect after VPN login failed"),
                         }
+                    }
+                    if !ids.is_empty() {
+                        session.notify_tools_list_changed();
                     }
                 }
                 VpnState::NeedsLogin => tracing::warn!(

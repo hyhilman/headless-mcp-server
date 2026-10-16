@@ -30,6 +30,12 @@ login link with hub.vpn_login, show it to the user, wait until hub.vpn_status re
 /// Default timeout for tools/call routed to a backend.
 const DEFAULT_CALL_TIMEOUT_SECS: u64 = 30;
 
+/// A change that `subscriptions/listen` streams can be told about.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Change {
+    ToolsListChanged,
+    ResourceUpdated(String),
+}
 
 /// Transport-agnostic MCP request/notification dispatch.
 ///
@@ -44,6 +50,7 @@ pub struct McpSession {
     pub(crate) vpn: Option<Arc<VpnManager>>,
     /// VPN names this session exposes through the `hub.vpn_*` tools.
     pub(crate) vpn_tools: Vec<String>,
+    pub(crate) changes: tokio::sync::broadcast::Sender<Change>,
 }
 
 impl McpSession {
@@ -54,7 +61,14 @@ impl McpSession {
             initialized: AtomicBool::new(false),
             vpn: None,
             vpn_tools: Vec::new(),
+            changes: tokio::sync::broadcast::channel(64).0,
         }
+    }
+
+    /// Tell `subscriptions/listen` streams that the tool list changed
+    /// (e.g. a backend reconnected).
+    pub fn notify_tools_list_changed(&self) {
+        let _ = self.changes.send(Change::ToolsListChanged);
     }
 
     /// Attach the VPN manager. Calls to backends that require a VPN are
@@ -66,12 +80,16 @@ impl McpSession {
             .filter(|name| manager.status(name).is_some())
             .collect();
         self.vpn_tools.sort();
+        self.forward_vpn_changes(&manager);
         self.vpn = Some(manager);
         self
     }
 
     /// Handles one incoming message. Returns `Some` for a request (always
     /// reply, success or error) and `None` for a notification or response.
+    ///
+    /// `subscriptions/listen` needs a streaming transport; use
+    /// [`McpSession::handle_streaming`] for that.
     pub async fn handle(&self, message: JsonRpcMessage) -> Option<JsonRpcMessage> {
         match message {
             JsonRpcMessage::Request(request) => Some(self.handle_request(request).await),
@@ -86,7 +104,7 @@ impl McpSession {
         }
     }
 
-    async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcMessage {
+    pub(crate) async fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcMessage {
         let method = request.method.clone();
         let (result, tool_name, outcome) = self.dispatch_request(&request).await;
 
@@ -123,6 +141,11 @@ impl McpSession {
             "initialize" if !ctx.is_modern() => self.simple(self.handle_initialize()),
             "tools/list" => self.simple(self.handle_tools_list(&ctx)),
             "tools/call" => self.handle_tools_call(request.params.clone(), &ctx).await,
+            "resources/list" => self.simple(self.handle_resources_list(&ctx)),
+            "resources/read" => self.simple(self.handle_resources_read(request.params.as_ref(), &ctx)),
+            "subscriptions/listen" => self.simple(Err(JsonRpcError::invalid_request(
+                "subscriptions/listen needs a streaming transport",
+            ))),
             other => self.simple(Err(JsonRpcError::method_not_found(format!(
                 "unknown method: {other}"
             )))),
@@ -144,7 +167,11 @@ impl McpSession {
     }
 
     fn capabilities(&self) -> Value {
-        serde_json::json!({ "tools": { "listChanged": false } })
+        let mut caps = serde_json::json!({ "tools": { "listChanged": true } });
+        if !self.vpn_tools.is_empty() {
+            caps["resources"] = serde_json::json!({ "subscribe": true, "listChanged": false });
+        }
+        caps
     }
 
     fn handle_discover(&self) -> Value {
@@ -175,7 +202,7 @@ impl McpSession {
     }
 
     /// Legacy requests need `initialize` first; modern requests are stateless.
-    fn require_initialized(&self, ctx: &RequestCtx) -> Result<(), JsonRpcError> {
+    pub(crate) fn require_initialized(&self, ctx: &RequestCtx) -> Result<(), JsonRpcError> {
         if ctx.is_modern() || self.initialized.load(Ordering::SeqCst) {
             Ok(())
         } else {
@@ -261,7 +288,7 @@ impl McpSession {
         }
     }
 
-    fn handle_notification(&self, notification: JsonRpcNotification) {
+    pub(crate) fn handle_notification(&self, notification: JsonRpcNotification) {
         match notification.method.as_str() {
             "notifications/initialized" => {
                 tracing::debug!("client acknowledged initialization");
@@ -622,6 +649,35 @@ mod tests {
         assert_eq!(result["isError"], true);
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no such tool"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn vpn_status_is_readable_as_resource() {
+        let (session, vpn) = vpn_session("echo NeedsLogin", true).await;
+        vpn.refresh("netbird").await.unwrap();
+
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(3, "resources/list", None)))
+            .await
+            .unwrap();
+        let JsonRpcMessage::SuccessResponse(ok) = reply else { panic!("{reply:?}") };
+        assert_eq!(ok.result["resources"][0]["uri"], "hub://vpn/netbird");
+
+        let params = serde_json::json!({ "uri": "hub://vpn/netbird" });
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(4, "resources/read", Some(params))))
+            .await
+            .unwrap();
+        let JsonRpcMessage::SuccessResponse(ok) = reply else { panic!("{reply:?}") };
+        let text = ok.result["contents"][0]["text"].as_str().unwrap();
+        assert!(text.contains("needs_login"), "{text}");
+
+        let params = serde_json::json!({ "uri": "hub://vpn/other" });
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(5, "resources/read", Some(params))))
+            .await
+            .unwrap();
+        assert!(matches!(reply, JsonRpcMessage::ErrorResponse(_)));
     }
 
     #[tokio::test]

@@ -11,7 +11,9 @@
 mod audit;
 pub mod protocol;
 mod session;
+mod subscriptions;
 mod vpn_tools;
 
 pub use audit::{AuditEvent, AuditLogger, AuditOutcome, TracingAuditLogger};
 pub use session::{McpSession, PROTOCOL_VERSION};
+pub use subscriptions::SessionReply;

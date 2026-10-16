@@ -1,7 +1,9 @@
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use headless_mcp_server::SessionReply;
 use headless_mcp_server::protocol::{
     request_protocol_version, HEADER_MISMATCH, UNSUPPORTED_PROTOCOL_VERSION,
 };
@@ -52,13 +54,25 @@ pub(crate) async fn handle_mcp(
         }
     }
 
-    match state.session.handle(message).await {
-        Some(reply) => {
+    match state.session.handle_streaming(message).await {
+        Some(SessionReply::Message(reply)) => {
             let status = if modern.is_some() { modern_status(&reply) } else { StatusCode::OK };
             json_response(status, &reply)
         }
+        Some(SessionReply::Stream { messages, .. }) => sse_response(messages),
         None => StatusCode::ACCEPTED.into_response(),
     }
+}
+
+/// Long-lived SSE response for `subscriptions/listen`. Closing the HTTP
+/// connection drops the receiver, which ends the subscription.
+fn sse_response(messages: tokio::sync::mpsc::UnboundedReceiver<JsonRpcMessage>) -> Response {
+    let stream = futures_util::stream::unfold(messages, |mut rx| async move {
+        let message = rx.recv().await?;
+        let data = serde_json::to_string(&message).unwrap_or_default();
+        Some((Ok::<_, std::convert::Infallible>(Event::default().data(data)), rx))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }
 
 /// HTTP status for a modern reply, per the 2026-07-28 Streamable HTTP rules.
