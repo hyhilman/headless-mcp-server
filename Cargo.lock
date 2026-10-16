@@ -684,10 +684,12 @@ name = "headless-mcp-server"
 version = "0.0.8"
 dependencies = [
  "async-trait",
+ "base64",
  "headless-mcp-core",
  "headless-mcp-registry",
  "headless-mcp-vpn",
  "headless-mcp-wire",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

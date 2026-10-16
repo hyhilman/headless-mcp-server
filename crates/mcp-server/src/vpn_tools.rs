@@ -2,11 +2,28 @@
 //! `hub.vpn_login_complete`) and the `requires_vpn` call gate.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use headless_mcp_vpn::{LoginOutcome, VpnManager, VpnState};
 use serde_json::Value;
 
-use crate::session::{make_success_result, make_text_result, McpSession, ToolCallParams};
+use crate::protocol::RequestCtx;
+use crate::session::{
+    make_error_result, make_success_result, make_text_result, McpSession, ToolCallParams,
+};
+
+/// `inputRequests` key for the VPN login elicitation.
+const LOGIN_INPUT_KEY: &str = "vpn_login";
+/// How long a `requestState` for a VPN login stays valid.
+const LOGIN_STATE_TTL_SECS: u64 = 900;
+
+/// A tool call blocked by a VPN that is not connected.
+pub(crate) struct VpnBlock {
+    pub vpn: String,
+    pub backend: String,
+    pub state: VpnState,
+    pub pending: bool,
+}
 
 /// Hub-owned tools. The `hub.` namespace is reserved for these.
 pub(crate) const VPN_STATUS_TOOL: &str = "hub.vpn_status";
@@ -214,23 +231,129 @@ impl McpSession {
 
     /// Returns an actionable error if the tool's backend needs a VPN that
     /// is known to be down. `Unknown` (not checked yet) is let through.
-    pub(crate) fn vpn_gate(&self, tool: &str) -> Option<String> {
+    pub(crate) fn vpn_block(&self, tool: &str) -> Option<VpnBlock> {
         let manager = self.vpn.as_ref()?;
-        let (backend_id, required) = self.registry.tool_requirements(tool)?;
-        for name in required {
-            let status = manager.status(&name)?;
+        let (backend, required) = self.registry.tool_requirements(tool)?;
+        required.into_iter().find_map(|vpn| {
+            let status = manager.status(&vpn)?;
             if matches!(status.state, VpnState::Connected | VpnState::Unknown) {
-                continue;
+                return None;
             }
-            let mut message = format!(
-                "VPN_REQUIRED: backend '{backend_id}' needs VPN '{name}', which is {state}.",
-                state = status.state,
-            );
-            message.push(' ');
-            message.push_str(&self.login_instructions(&name, status.login.is_some()));
-            return Some(message);
+            Some(VpnBlock {
+                vpn,
+                backend: backend.clone(),
+                state: status.state,
+                pending: status.login.is_some(),
+            })
+        })
+    }
+
+    /// Text-only "VPN_REQUIRED" result for clients without URL elicitation.
+    pub(crate) fn vpn_required_result(&self, block: &VpnBlock) -> Value {
+        make_error_result(format!(
+            "VPN_REQUIRED: backend '{}' needs VPN '{}', which is {}. {}",
+            block.backend,
+            block.vpn,
+            block.state,
+            self.login_instructions(&block.vpn, block.pending),
+        ))
+    }
+
+    /// Multi round-trip login (2026-07-28 + URL elicitation): instead of an
+    /// error, ask the client to show the login link to the user, then let the
+    /// retried call through once the VPN is connected.
+    ///
+    /// Returns `None` when the call may proceed (VPN connected meanwhile),
+    /// otherwise the result to send back.
+    pub(crate) async fn vpn_login_round_trip(
+        &self,
+        params: &ToolCallParams,
+        block: &VpnBlock,
+        ctx: &RequestCtx,
+    ) -> Option<Value> {
+        let usable = ctx.is_modern()
+            && ctx.supports_url_elicitation()
+            && self.vpn_tools.iter().any(|n| n == &block.vpn);
+        let Some(manager) = self.vpn.as_ref().filter(|_| usable) else {
+            return Some(self.vpn_required_result(block));
+        };
+
+        // A retry: the user has seen the link (or declined it).
+        if let Some(token) = &params.request_state {
+            if !self.state_signer.verify(token, &block.vpn, &params.name) {
+                return Some(make_error_result(
+                    "requestState is invalid or expired; call the tool again without it".into(),
+                ));
+            }
+            let action = params
+                .input_responses
+                .as_ref()
+                .and_then(|r| r.get(LOGIN_INPUT_KEY))
+                .and_then(|r| r.get("action"))
+                .and_then(Value::as_str);
+            if matches!(action, Some("decline") | Some("cancel")) {
+                return Some(make_error_result(format!(
+                    "The user declined to sign in to VPN '{}'; '{}' cannot run without it.",
+                    block.vpn, params.name
+                )));
+            }
+            if self.wait_for_vpn(manager, &block.vpn).await {
+                return None;
+            }
         }
-        None
+
+        match manager.start_login(&block.vpn).await {
+            Ok(LoginOutcome::AlreadyConnected { .. }) => None,
+            Ok(LoginOutcome::Pending { login }) => {
+                let mut message = format!(
+                    "Sign in to VPN '{}' so '{}' can run. The login stays open for {} minutes.",
+                    block.vpn,
+                    params.name,
+                    login.timeout_at_unix.saturating_sub(login.started_at_unix) / 60,
+                );
+                // Keep device codes etc., but no other links in the message.
+                let extra: Vec<&str> = login
+                    .message
+                    .lines()
+                    .filter(|l| !l.contains("://"))
+                    .collect();
+                if !extra.is_empty() {
+                    message.push_str("\n");
+                    message.push_str(&extra.join("\n"));
+                }
+                Some(serde_json::json!({
+                    "resultType": "input_required",
+                    "inputRequests": {
+                        LOGIN_INPUT_KEY: {
+                            "method": "elicitation/create",
+                            "params": { "mode": "url", "url": login.url, "message": message },
+                        },
+                    },
+                    "requestState": self.state_signer.issue(&block.vpn, &params.name, LOGIN_STATE_TTL_SECS),
+                }))
+            }
+            Err(e) => Some(make_error_result(format!(
+                "VPN_REQUIRED: backend '{}' needs VPN '{}', and starting the login failed: {e}",
+                block.backend, block.vpn
+            ))),
+        }
+    }
+
+    /// Wait (bounded) for the VPN to report connected.
+    async fn wait_for_vpn(&self, manager: &Arc<VpnManager>, vpn: &str) -> bool {
+        let deadline = Instant::now() + self.login_wait;
+        loop {
+            if manager.status(vpn).is_some_and(|s| s.state == VpnState::Connected) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return manager
+                    .refresh(vpn)
+                    .await
+                    .is_ok_and(|s| s.state == VpnState::Connected);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// Hint for "no such tool": tools behind a down VPN are not listed.

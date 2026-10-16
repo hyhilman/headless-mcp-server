@@ -51,6 +51,9 @@ pub struct McpSession {
     /// VPN names this session exposes through the `hub.vpn_*` tools.
     pub(crate) vpn_tools: Vec<String>,
     pub(crate) changes: tokio::sync::broadcast::Sender<Change>,
+    pub(crate) state_signer: crate::request_state::StateSigner,
+    /// How long a retried call waits for a VPN login to finish.
+    pub(crate) login_wait: Duration,
 }
 
 impl McpSession {
@@ -62,7 +65,15 @@ impl McpSession {
             vpn: None,
             vpn_tools: Vec::new(),
             changes: tokio::sync::broadcast::channel(64).0,
+            state_signer: crate::request_state::StateSigner::new(),
+            login_wait: Duration::from_secs(20),
         }
+    }
+
+    /// How long a retried call waits for a pending VPN login to finish.
+    pub fn with_login_wait(mut self, wait: Duration) -> Self {
+        self.login_wait = wait;
+        self
     }
 
     /// Tell `subscriptions/listen` streams that the tool list changed
@@ -259,9 +270,10 @@ impl McpSession {
             return (Ok(value), Some(tool_name), outcome);
         }
 
-        if let Some(message) = self.vpn_gate(&params.name) {
-            let result = make_error_result(message);
-            return (Ok(result), Some(tool_name), AuditOutcome::Error { code: -32603 });
+        if let Some(block) = self.vpn_block(&params.name) {
+            if let Some(result) = self.vpn_login_round_trip(&params, &block, ctx).await {
+                return (Ok(result), Some(tool_name), AuditOutcome::Error { code: -32603 });
+            }
         }
 
         let known = self.registry.has_tool(&params.name);
@@ -305,6 +317,12 @@ pub(crate) struct ToolCallParams {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) arguments: Option<Value>,
+    /// Multi round-trip retry: echoed `requestState`.
+    #[serde(default, rename = "requestState")]
+    pub(crate) request_state: Option<String>,
+    /// Multi round-trip retry: answers to our `inputRequests`.
+    #[serde(default, rename = "inputResponses")]
+    pub(crate) input_responses: Option<Value>,
 }
 
 pub(crate) fn make_success_result(value: Value) -> Value {
@@ -535,6 +553,10 @@ mod tests {
     }
 
     async fn vpn_session(health: &str, expose: bool) -> (McpSession, Arc<VpnManager>) {
+        vpn_session_with(vpn_def(health), expose).await
+    }
+
+    async fn vpn_session_with(vpn_def: VpnDef, expose: bool) -> (McpSession, Arc<VpnManager>) {
         let registry = Arc::new(BackendRegistry::new());
         let def = BackendDef {
             id: "internal".into(),
@@ -559,10 +581,11 @@ mod tests {
         registry.register(def, Arc::new(EchoBackend)).await.unwrap();
         registry.connect_all().await;
 
-        let vpn = VpnManager::new(vec![vpn_def(health)]);
+        let vpn = VpnManager::new(vec![vpn_def]);
         let exposed = if expose { vpn.names() } else { vec![] };
         let session = McpSession::new(registry, Arc::new(TracingAuditLogger))
-            .with_vpn(vpn.clone(), exposed);
+            .with_vpn(vpn.clone(), exposed)
+            .with_login_wait(Duration::from_secs(5));
         session
             .handle(JsonRpcMessage::Request(request(1, "initialize", None)))
             .await;
@@ -678,6 +701,79 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(reply, JsonRpcMessage::ErrorResponse(_)));
+    }
+
+    async fn call_modern(session: &McpSession, params: Value) -> Value {
+        let mut params = params;
+        params["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": { "elicitation": { "url": {} } }
+        });
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(20, "tools/call", Some(params))))
+            .await
+            .unwrap();
+        let JsonRpcMessage::SuccessResponse(ok) = reply else { panic!("{reply:?}") };
+        ok.result
+    }
+
+    #[tokio::test]
+    async fn blocked_call_round_trips_through_url_elicitation() {
+        let dir = std::env::temp_dir().join(format!("hmcp-mrtr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flag = dir.join("ok");
+        let _ = std::fs::remove_file(&flag);
+        let flag = flag.display().to_string();
+        let mut def = vpn_def(&format!("test -f {flag} && echo ok || echo NeedsLogin"));
+        def.login = vec![
+            "sh".into(),
+            "-c".into(),
+            format!("echo 'login: https://idp.example/device'; echo 'Code: WXYZ'; sleep 1; touch {flag}"),
+        ];
+        let (session, vpn) = vpn_session_with(def, true).await;
+        vpn.refresh("netbird").await.unwrap();
+
+        let first = call_modern(&session, serde_json::json!({ "name": "internal.query" })).await;
+        assert_eq!(first["resultType"], "input_required", "{first}");
+        let elicit = &first["inputRequests"]["vpn_login"];
+        assert_eq!(elicit["method"], "elicitation/create");
+        assert_eq!(elicit["params"]["mode"], "url");
+        assert_eq!(elicit["params"]["url"], "https://idp.example/device");
+        assert!(elicit["params"]["message"].as_str().unwrap().contains("Code: WXYZ"));
+        let state = first["requestState"].as_str().unwrap().to_string();
+
+        // Tampered state is rejected.
+        let bad = call_modern(&session, serde_json::json!({
+            "name": "internal.query", "requestState": format!("{state}x"),
+            "inputResponses": { "vpn_login": { "action": "accept" } }
+        })).await;
+        assert_eq!(bad["isError"], true);
+
+        // Accepted: the retry waits for the login, then runs the tool.
+        let done = call_modern(&session, serde_json::json!({
+            "name": "internal.query", "requestState": state,
+            "inputResponses": { "vpn_login": { "action": "accept" } }
+        })).await;
+        assert_eq!(done["isError"], false, "{done}");
+        assert_eq!(done["resultType"], "complete");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn declined_login_returns_error() {
+        let mut def = vpn_def("echo NeedsLogin");
+        def.login = vec!["sh".into(), "-c".into(), "echo https://idp.example/x; sleep 5".into()];
+        let (session, vpn) = vpn_session_with(def, true).await;
+        vpn.refresh("netbird").await.unwrap();
+
+        let first = call_modern(&session, serde_json::json!({ "name": "internal.query" })).await;
+        let state = first["requestState"].as_str().unwrap();
+        let declined = call_modern(&session, serde_json::json!({
+            "name": "internal.query", "requestState": state,
+            "inputResponses": { "vpn_login": { "action": "decline" } }
+        })).await;
+        assert_eq!(declined["isError"], true);
+        assert!(declined["content"][0]["text"].as_str().unwrap().contains("declined"));
     }
 
     #[tokio::test]

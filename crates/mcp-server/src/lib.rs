@@ -10,6 +10,7 @@
 
 mod audit;
 pub mod protocol;
+mod request_state;
 mod session;
 mod subscriptions;
 mod vpn_tools;
