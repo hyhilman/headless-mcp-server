@@ -118,6 +118,10 @@ struct RawBackendConfig {
     pub tools_deny: Vec<String>,
     #[serde(default)]
     pub requires_vpn: Vec<String>,
+    #[serde(default)]
+    pub pin_args: toml::Table,
+    #[serde(default)]
+    pub deny_args: Vec<String>,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -372,6 +376,11 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
             tools_allow: bc.tools_allow.clone(),
             tools_deny: bc.tools_deny.clone(),
             requires_vpn: bc.requires_vpn.clone(),
+            pin_args: match serde_json::to_value(&bc.pin_args)? {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            },
+            deny_args: bc.deny_args.clone(),
         });
     }
 

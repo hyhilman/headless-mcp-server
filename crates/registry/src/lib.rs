@@ -119,7 +119,7 @@ impl BackendRegistry {
 
     /// Connect a specific backend and index its tools.
     async fn connect_backend(&self, id: &str) -> Result<(), BackendError> {
-        let (backend, namespace, _connection_mode, tools_allow, tools_deny) = {
+        let (backend, namespace, _connection_mode, tools_allow, tools_deny, hidden_args) = {
             let backends = self.backends.read().unwrap();
             let handle = backends.get(id).ok_or_else(|| {
                 BackendError::new(
@@ -133,6 +133,7 @@ impl BackendRegistry {
                 handle.def.connection_mode,
                 handle.def.tools_allow.clone(),
                 handle.def.tools_deny.clone(),
+                hidden_args(&handle.def),
             )
         };
 
@@ -179,7 +180,7 @@ impl BackendRegistry {
                     descriptor: ToolDescriptor {
                         name: exposed_name,
                         description: tool.description.clone(),
-                        input_schema: tool.input_schema.clone(),
+                        input_schema: strip_schema_args(&tool.input_schema, &hidden_args),
                     },
                 },
             );
@@ -329,7 +330,7 @@ impl BackendRegistry {
         args: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, BackendError> {
-        let (backend_id, backend, downstream_name, mode) = {
+        let (backend_id, backend, downstream_name, mode, args) = {
             let tool_index = self.tool_index.read().unwrap();
             let routed = tool_index
                 .get(exposed_name)
@@ -356,6 +357,7 @@ impl BackendRegistry {
                 handle.backend.clone(),
                 routed.downstream_name.clone(),
                 handle.def.connection_mode,
+                apply_arg_policy(&handle.def, args)?,
             )
         };
 
@@ -450,6 +452,53 @@ impl BackendRegistry {
     }
 }
 
+/// Argument names hidden from callers: pinned plus denied.
+fn hidden_args(def: &BackendDef) -> Vec<String> {
+    def.pin_args.keys().cloned().chain(def.deny_args.iter().cloned()).collect()
+}
+
+/// Remove `hidden` from a JSON schema's `properties` and `required`.
+fn strip_schema_args(schema: &Value, hidden: &[String]) -> Value {
+    let mut schema = schema.clone();
+    if hidden.is_empty() {
+        return schema;
+    }
+    if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        props.retain(|k, _| !hidden.contains(k));
+    }
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|v| !v.as_str().is_some_and(|k| hidden.iter().any(|h| h == k)));
+    }
+    schema
+}
+
+/// Reject denied arguments, then force pinned ones.
+fn apply_arg_policy(def: &BackendDef, args: Option<Value>) -> Result<Option<Value>, BackendError> {
+    if def.pin_args.is_empty() && def.deny_args.is_empty() {
+        return Ok(args);
+    }
+    let mut obj = match args {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(obj)) => obj,
+        Some(_) => {
+            return Err(BackendError::new(
+                BackendErrorKind::Protocol,
+                "tool arguments must be an object",
+            ))
+        }
+    };
+    if let Some(denied) = def.deny_args.iter().find(|k| obj.contains_key(k.as_str())) {
+        return Err(BackendError::new(
+            BackendErrorKind::Protocol,
+            format!("argument '{denied}' is not allowed for backend '{}'", def.id),
+        ));
+    }
+    for (k, v) in &def.pin_args {
+        obj.insert(k.clone(), v.clone());
+    }
+    Ok(Some(Value::Object(obj)))
+}
+
 /// Compute the exposed (namespaced) name for a tool.
 fn compute_exposed_name(namespace: Option<&str>, tool_name: &str) -> String {
     match namespace {
@@ -513,10 +562,10 @@ mod tests {
         async fn call_tool(
             &self,
             name: &str,
-            _arguments: Option<Value>,
+            arguments: Option<Value>,
             _timeout: Duration,
         ) -> BackendResult<Value> {
-            Ok(serde_json::json!({"called": name, "backend": self.id}))
+            Ok(serde_json::json!({"called": name, "backend": self.id, "args": arguments}))
         }
 
         async fn disconnect(&self) -> BackendResult<()> {
@@ -562,6 +611,8 @@ mod tests {
             tools_allow: vec![],
             tools_deny: vec![],
             requires_vpn: vec![],
+            pin_args: serde_json::Map::new(),
+            deny_args: vec![],
         }
     }
 
@@ -601,5 +652,51 @@ mod tests {
 
         assert_eq!(result["called"], "send_message");
         assert_eq!(result["backend"], "slack");
+    }
+
+    #[tokio::test]
+    async fn pinned_and_denied_args_are_enforced_and_hidden() {
+        let registry = BackendRegistry::new();
+        let mut tool = make_tool("list_buckets");
+        tool.input_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "profile": {"type": "string"},
+                "account_id": {"type": "string"},
+                "prefix": {"type": "string"}
+            },
+            "required": ["profile", "prefix"]
+        });
+        let mut def = make_def("aws", Some("aws"));
+        def.pin_args.insert("profile".into(), serde_json::json!("prod"));
+        def.deny_args = vec!["account_id".into()];
+        registry
+            .register(def, Arc::new(MockBackend::new("aws", vec![tool])))
+            .await
+            .unwrap();
+        registry.connect_backend("aws").await.unwrap();
+
+        let schema = &registry.aggregated_tools()[0].input_schema;
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
+        assert_eq!(schema["required"], serde_json::json!(["prefix"]));
+
+        let result = registry
+            .route_call(
+                "aws.list_buckets",
+                Some(serde_json::json!({"profile": "admin", "prefix": "x"})),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["args"], serde_json::json!({"profile": "prod", "prefix": "x"}));
+
+        let denied = registry
+            .route_call(
+                "aws.list_buckets",
+                Some(serde_json::json!({"account_id": "123"})),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(denied.is_err());
     }
 }

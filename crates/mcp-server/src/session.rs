@@ -615,6 +615,8 @@ mod tests {
             tools_allow: vec![],
             tools_deny: vec![],
             requires_vpn: vec!["netbird".into()],
+            pin_args: serde_json::Map::new(),
+            deny_args: vec![],
         };
         registry.register(def, Arc::new(EchoBackend)).await.unwrap();
         registry.connect_all().await;

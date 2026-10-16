@@ -52,6 +52,16 @@ pub struct BackendDef {
     /// this backend are forwarded.
     #[serde(default)]
     pub requires_vpn: Vec<String>,
+
+    /// Tool arguments the hub always sets, overriding whatever the caller
+    /// sends (e.g. `profile = "prod"`). Removed from advertised schemas.
+    #[serde(default)]
+    pub pin_args: serde_json::Map<String, Value>,
+
+    /// Tool arguments callers may not send; calls including them are
+    /// rejected. Removed from advertised schemas.
+    #[serde(default)]
+    pub deny_args: Vec<String>,
 }
 
 fn default_connect_timeout() -> u64 {
