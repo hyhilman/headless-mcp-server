@@ -591,6 +591,7 @@ dependencies = [
  "headless-mcp-server",
  "headless-mcp-transport-http",
  "headless-mcp-transport-stdio",
+ "headless-mcp-vpn",
  "headless-mcp-wire",
  "serde",
  "serde_json",
@@ -684,6 +685,7 @@ dependencies = [
  "async-trait",
  "headless-mcp-core",
  "headless-mcp-registry",
+ "headless-mcp-vpn",
  "headless-mcp-wire",
  "serde",
  "serde_json",
@@ -716,6 +718,16 @@ dependencies = [
  "headless-mcp-registry",
  "headless-mcp-server",
  "headless-mcp-wire",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "headless-mcp-vpn"
+version = "0.0.8"
+dependencies = [
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

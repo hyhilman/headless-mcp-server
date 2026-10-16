@@ -13,6 +13,7 @@ use headless_mcp_core::{BackendTransport, McpBackend};
 use headless_mcp_registry::BackendRegistry;
 use headless_mcp_server::{McpSession, TracingAuditLogger};
 use headless_mcp_secrets::EncryptedFileSecretStore;
+use headless_mcp_vpn::{LoginOutcome, VpnEvent, VpnManager, VpnState};
 
 use config::load_config;
 use one_shot::run_one_shot;
@@ -58,6 +59,18 @@ enum Commands {
         /// Backend ID, or --all for all OAuth2 backends.
         backend: Option<String>,
     },
+    /// Check VPN status or run a VPN's SSO login.
+    Vpn {
+        #[command(subcommand)] action: Option<VpnAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VpnAction {
+    /// Run the health/expiry commands and print the state.
+    Status { name: Option<String> },
+    /// Run the login command, print the link, wait until connected.
+    Login { name: String },
 }
 
 #[tokio::main]
@@ -93,6 +106,9 @@ async fn main() -> ExitCode {
         }
         Some(Commands::Config) => {
             run_print_config(config_path); Ok(())
+        }
+        Some(Commands::Vpn { action }) => {
+            run_vpn(config_path, action).await
         }
         // default (stdio serve) or --dry-run
         None if cli.dry_run => {
@@ -151,6 +167,11 @@ async fn run_serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut cfg = load_config(config_path)?;
 
+    let vpn = VpnManager::new(cfg.vpn.clone());
+    if !vpn.is_empty() {
+        vpn.start_watchers();
+    }
+
     // If expose blocks exist, start one HTTP server per port
     if !cfg.expose.is_empty() {
         if !http {
@@ -164,11 +185,14 @@ async fn run_serve(
         for eb in expose_blocks {
             let label = eb.label.clone().unwrap_or_else(|| eb.port.to_string());
             let addr: SocketAddr = bind_addr_from_expose(eb.port);
-            let reg = build_expose_registry(&cfg, &eb, store.clone(), daemon).await?;
+            let reg = Arc::new(build_expose_registry(&cfg, &eb, store.clone(), daemon).await?);
             for (id, r) in &reg.connect_all().await {
                 if let Err(e) = r { tracing::warn!(%id, %label, %e, "connect failed"); }
             }
-            let session = Arc::new(McpSession::new(Arc::new(reg), Arc::new(TracingAuditLogger)));
+            spawn_vpn_reconnect(&vpn, reg.clone());
+            let session = Arc::new(
+                McpSession::new(reg, Arc::new(TracingAuditLogger)).with_vpn(vpn.clone(), eb.vpn.clone()),
+            );
             let token = hub_token.clone();
             tracing::info!(%label, %addr, "starting expose");
             handles.push(tokio::spawn(async move {
@@ -189,11 +213,14 @@ async fn run_serve(
     }
 
     // No expose blocks: single registry with all backends
-    let reg = build_registry(&cfg, store, daemon).await?;
+    let reg = Arc::new(build_registry(&cfg, store, daemon).await?);
     for (id, r) in &reg.connect_all().await {
         if let Err(e) = r { tracing::warn!(%id, %e, "connect failed"); }
     }
-    let session = Arc::new(McpSession::new(Arc::new(reg), Arc::new(TracingAuditLogger)));
+    spawn_vpn_reconnect(&vpn, reg.clone());
+    let session = Arc::new(
+        McpSession::new(reg, Arc::new(TracingAuditLogger)).with_vpn(vpn.clone(), vpn.names()),
+    );
     if http {
         let token = cfg.auth.as_ref().and_then(|a| a.hub_token.clone())
             .unwrap_or_else(|| std::env::var("HEADLESS_MCP_TOKEN").unwrap_or_default());
@@ -206,6 +233,36 @@ async fn run_serve(
         headless_mcp_transport_stdio::run_stdio(session).await?;
     }
     Ok(())
+}
+
+/// When a VPN comes back after being down, reconnect the backends behind it.
+fn spawn_vpn_reconnect(vpn: &Arc<VpnManager>, reg: Arc<BackendRegistry>) {
+    if vpn.is_empty() { return; }
+    let mut events = vpn.subscribe();
+    tokio::spawn(async move {
+        loop {
+            let VpnEvent::StateChanged { name, from, to } = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            match to {
+                VpnState::Connected if matches!(from, VpnState::NeedsLogin | VpnState::Down) => {
+                    for id in reg.backends_requiring_vpn(&name) {
+                        match reg.reconnect_backend(&id).await {
+                            Ok(()) => tracing::info!(%id, vpn = %name, "backend reconnected after VPN login"),
+                            Err(e) => tracing::warn!(%id, vpn = %name, %e, "reconnect after VPN login failed"),
+                        }
+                    }
+                }
+                VpnState::NeedsLogin => tracing::warn!(
+                    vpn = %name,
+                    "VPN needs login: call hub.vpn_login or run 'headless-mcp vpn login {name}'"
+                ),
+                _ => {}
+            }
+        }
+    });
 }
 
 fn bind_addr_from_expose(port: u16) -> SocketAddr {
@@ -294,6 +351,9 @@ fn run_print_config(config_path: Option<&str>) {
                 BackendTransport::Http { url, .. } => format!("http({url})"),
             };
             println!("  {:<20} {:<40} ns={}", def.id, ts, def.namespace.as_deref().unwrap_or("<none>"));
+        }
+        for v in &c.vpn {
+            println!("  vpn {:<16} health={:?} login={:?}", v.name, v.health, v.login);
         }
     }
 }
@@ -385,6 +445,53 @@ async fn auth_one(
         Err(e) => {
             eprintln!("❌ {}: {}", def.id, e);
         }
+    }
+    Ok(())
+}
+
+// ── vpn ────────────────────────────────────────────────────────────────
+
+async fn run_vpn(
+    config_path: Option<&str>,
+    action: Option<VpnAction>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = load_config(config_path)?;
+    let vpn = VpnManager::new(cfg.vpn);
+    if vpn.is_empty() {
+        println!("No VPNs configured.");
+        return Ok(());
+    }
+    match action.unwrap_or(VpnAction::Status { name: None }) {
+        VpnAction::Status { name } => {
+            let names = name.map(|n| vec![n]).unwrap_or_else(|| vpn.names());
+            for n in names {
+                let s = vpn.refresh(&n).await?;
+                println!(
+                    "  {:<16} {:<12} expires={} {}",
+                    s.name,
+                    s.state.to_string(),
+                    s.expires_at.as_deref().unwrap_or("-"),
+                    s.detail.as_deref().unwrap_or(""),
+                );
+            }
+        }
+        VpnAction::Login { name } => match vpn.start_login(&name).await? {
+            LoginOutcome::AlreadyConnected { .. } => println!("✅ {name} is already connected."),
+            LoginOutcome::Pending { login } => {
+                println!("\n═══ Sign in to {name} ═══\n  {}\n\n{}\n", login.url, login.message);
+                println!("Waiting for sign-in...");
+                // The background task clears `login` once the command exits or times out.
+                while vpn.status(&name).is_some_and(|s| s.login.is_some()) {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                let s = vpn.refresh(&name).await?;
+                if s.state == VpnState::Connected {
+                    println!("✅ {name} connected.");
+                } else {
+                    return Err(format!("{name} is still {}", s.state).into());
+                }
+            }
+        },
     }
     Ok(())
 }

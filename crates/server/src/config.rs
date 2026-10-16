@@ -1,4 +1,5 @@
 use headless_mcp_core::{BackendDef, BackendTransport, ConnectionMode, StderrMode};
+use headless_mcp_vpn::VpnDef;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,6 +13,48 @@ struct RawConfig {
     pub backends: HashMap<String, RawBackendConfig>,
     #[serde(default)]
     pub expose: Vec<RawExposeBlock>,
+    #[serde(default)]
+    pub vpn: HashMap<String, RawVpnConfig>,
+}
+
+/// `[vpn.<name>]`: fixed commands only. Nothing here can be supplied by a caller.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVpnConfig {
+    pub health: Vec<String>,
+    #[serde(default)]
+    pub healthy_if: Vec<String>,
+    #[serde(default)]
+    pub needs_login_if: Vec<String>,
+    #[serde(default)]
+    pub expiry: Option<Vec<String>>,
+    pub login: Vec<String>,
+    #[serde(default = "default_url_prefixes")]
+    pub url_prefixes: Vec<String>,
+    #[serde(default = "default_vpn_check_interval")]
+    pub check_interval_secs: u64,
+    #[serde(default = "default_vpn_command_timeout")]
+    pub command_timeout_secs: u64,
+    #[serde(default = "default_vpn_url_wait")]
+    pub url_wait_secs: u64,
+    #[serde(default = "default_vpn_login_timeout")]
+    pub login_timeout_secs: u64,
+}
+
+fn default_url_prefixes() -> Vec<String> {
+    vec!["https://".to_string()]
+}
+fn default_vpn_check_interval() -> u64 {
+    60
+}
+fn default_vpn_command_timeout() -> u64 {
+    15
+}
+fn default_vpn_url_wait() -> u64 {
+    30
+}
+fn default_vpn_login_timeout() -> u64 {
+    600
 }
 
 #[derive(Debug, Deserialize)]
@@ -21,6 +64,9 @@ pub struct RawExposeBlock {
     pub label: Option<String>,
     #[serde(default)]
     pub backends: HashMap<String, RawExposeBackend>,
+    /// VPNs whose `hub.vpn_status` / `hub.vpn_login` tools this port exposes.
+    #[serde(default)]
+    pub vpn: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +116,8 @@ struct RawBackendConfig {
     pub tools_allow: Vec<String>,
     #[serde(default)]
     pub tools_deny: Vec<String>,
+    #[serde(default)]
+    pub requires_vpn: Vec<String>,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -108,6 +156,7 @@ pub struct HubConfig {
     /// HTTP expose blocks: port → filtered backends.
     /// If empty, serve uses stdio or single HTTP with all backends.
     pub expose: Vec<ExposeBlock>,
+    pub vpn: Vec<VpnDef>,
 }
 
 /// One HTTP listener exposing a subset of backends.
@@ -117,6 +166,8 @@ pub struct ExposeBlock {
     pub label: Option<String>,
     /// Backend IDs to include, with optional tool filters.
     pub backends: HashMap<String, ExposeBackendConfig>,
+    /// VPN names whose hub tools are exposed on this port.
+    pub vpn: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -217,8 +268,38 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
         rate_limit: a.rate_limit,
     });
 
+    let mut vpn = Vec::new();
+    for (name, vc) in &raw_config.vpn {
+        if vc.health.is_empty() || vc.login.is_empty() {
+            return Err(format!("vpn '{name}': 'health' and 'login' must be non-empty commands").into());
+        }
+        if vc.expiry.as_ref().is_some_and(|c| c.is_empty()) {
+            return Err(format!("vpn '{name}': 'expiry' must be a non-empty command").into());
+        }
+        vpn.push(VpnDef {
+            name: name.clone(),
+            health: vc.health.clone(),
+            healthy_if: vc.healthy_if.clone(),
+            needs_login_if: vc.needs_login_if.clone(),
+            expiry: vc.expiry.clone(),
+            login: vc.login.clone(),
+            url_prefixes: vc.url_prefixes.clone(),
+            check_interval_secs: vc.check_interval_secs,
+            command_timeout_secs: vc.command_timeout_secs,
+            url_wait_secs: vc.url_wait_secs,
+            login_timeout_secs: vc.login_timeout_secs,
+        });
+    }
+    let check_vpn = |owner: String, names: &[String]| -> Result<(), String> {
+        match names.iter().find(|n| !raw_config.vpn.contains_key(n.as_str())) {
+            Some(n) => Err(format!("{owner}: unknown vpn '{n}' (no [vpn.{n}] section)")),
+            None => Ok(()),
+        }
+    };
+
     let mut backends = Vec::new();
     for (id, bc) in &raw_config.backends {
+        check_vpn(format!("backend '{id}'"), &bc.requires_vpn)?;
         let transport = match bc.transport.as_str() {
             "stdio" => {
                 let command = bc
@@ -290,12 +371,14 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
             stderr_mode,
             tools_allow: bc.tools_allow.clone(),
             tools_deny: bc.tools_deny.clone(),
+            requires_vpn: bc.requires_vpn.clone(),
         });
     }
 
     // Resolve expose blocks
     let mut expose = Vec::new();
     for eb in &raw_config.expose {
+        check_vpn(format!("expose port {}", eb.port), &eb.vpn)?;
         let mut eb_backends = HashMap::new();
         for (bid, ebc) in &eb.backends {
             eb_backends.insert(bid.clone(), ExposeBackendConfig {
@@ -307,8 +390,9 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
             port: eb.port,
             label: eb.label.clone(),
             backends: eb_backends,
+            vpn: eb.vpn.clone(),
         });
     }
 
-    Ok(HubConfig { auth, backends, expose })
+    Ok(HubConfig { auth, backends, expose, vpn })
 }

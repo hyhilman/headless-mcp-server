@@ -1,0 +1,13 @@
+[package]
+name = "headless-mcp-vpn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "VPN session manager: fixed health/expiry/login commands, login link capture, state watcher."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true

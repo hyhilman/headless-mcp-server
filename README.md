@@ -189,6 +189,42 @@ export HEADLESS_MCP_MASTER_KEY=$(openssl rand -hex 32)
 headless-mcp auth atlassian
 ```
 
+### VPN login (NetBird and similar)
+
+Some backends are only reachable over a VPN whose SSO login expires
+(NetBird defaults to 24h). Describe the VPN with three fixed commands:
+
+```toml
+[vpn.netbird]
+health = ["netbird", "status"]                 # run every check_interval_secs
+healthy_if = ["Management: Connected"]         # output substrings = connected
+needs_login_if = ["NeedsLogin", "SessionExpired", "LoginFailed"]
+expiry = ["/usr/local/bin/netbird-expiry"]     # optional; first output line is reported
+login = ["netbird", "up"]                      # must print the SSO link, then wait
+
+[backends.internal-db]
+transport = "stdio"
+command = "internal-db-mcp"
+requires_vpn = ["netbird"]                     # calls are blocked while netbird is down
+```
+
+Check the output strings against your NetBird version (`netbird status`).
+
+- **Agents only pick a VPN by name.** Commands come from the config file only.
+  `hub.vpn_status` and `hub.vpn_login` accept `{"vpn": "<name>"}` and nothing else.
+- **`hub.vpn_login`** runs `login`, returns the link (and any device code)
+  as soon as it is printed, and keeps the command running in the background
+  until you finish signing in (`login_timeout_secs`, default 600). A second call
+  while a login is waiting returns the same link instead of starting another.
+- **Blocked calls** to a backend with `requires_vpn` return an error telling the
+  agent to call `hub.vpn_login`, show you the link, and retry once connected.
+- **When the VPN comes back**, backends that require it reconnect automatically.
+- **Expose blocks** only get the `hub.vpn_*` tools if they list the VPN:
+  `vpn = ["netbird"]` under `[[expose]]`. Without expose blocks, all VPNs are exposed.
+- **From a terminal:** `headless-mcp vpn status` and `headless-mcp vpn login netbird`.
+
+The `hub.` tool namespace is reserved for these tools.
+
 ## Config reference
 
 ### Config file discovery
@@ -215,6 +251,24 @@ headless-mcp auth atlassian
 | `connect_timeout_secs` | Timeout for the initialize handshake (default: 10) |
 | `call_timeout_secs` | Timeout for each tool call (default: 30) |
 | `stderr_mode` | `"log-on-error"`, `"silent"`, `"passthrough"`, `"log-always"` |
+| `requires_vpn` | VPN names (`[vpn.<name>]`) that must be connected before calls are forwarded |
+
+### VPN options
+
+Under `[vpn.<name>]` (unknown keys are rejected):
+
+| Field | Description |
+|---|---|
+| `health` | Command (argv list). Exit 0 + `healthy_if` match = connected |
+| `healthy_if` | Output substrings meaning connected (empty = exit code only) |
+| `needs_login_if` | Output substrings meaning login required (checked first) |
+| `expiry` | Optional command; first output line reported as `expires_at` |
+| `login` | Command that prints the SSO link and waits for the user |
+| `url_prefixes` | How to spot the link in login output (default `["https://"]`) |
+| `check_interval_secs` | Health check interval (default 60) |
+| `command_timeout_secs` | Timeout for `health`/`expiry` (default 15) |
+| `url_wait_secs` | How long to wait for the link to appear (default 30) |
+| `login_timeout_secs` | How long the login may wait for the user (default 600) |
 
 ### OAuth2 options
 
@@ -238,6 +292,8 @@ COMMANDS:
   call <tool> [...]   One-shot: call a tool and print the result
   tools               List all aggregated tools from all backends
   config              Print the resolved config
+  vpn [status [<name>] | login <name>]
+                      Check VPN state, or print the SSO link and wait for login
   serve               Start the hub daemon
 
   serve OPTIONS:

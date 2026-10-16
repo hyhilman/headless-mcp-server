@@ -47,6 +47,11 @@ pub struct BackendDef {
     /// Applied after tools_allow.
     #[serde(default)]
     pub tools_deny: Vec<String>,
+
+    /// VPNs (by `[vpn.<name>]`) that must be connected before calls to
+    /// this backend are forwarded.
+    #[serde(default)]
+    pub requires_vpn: Vec<String>,
 }
 
 fn default_connect_timeout() -> u64 {

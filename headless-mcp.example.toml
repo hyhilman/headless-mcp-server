@@ -45,6 +45,17 @@ grant_type = "authorization_code"
 callback_port = 9799
 # No client_id — auto-registered via RFC 7591
 
+# ── VPN: NetBird (SSO login expires; default 24h) ──────────────────────
+# Fixed commands only — agents can pick the VPN by name, never change these.
+# [vpn.netbird]
+# health = ["netbird", "status"]
+# healthy_if = ["Management: Connected"]
+# needs_login_if = ["NeedsLogin", "SessionExpired", "LoginFailed"]
+# login = ["netbird", "up"]
+#
+# Then on any backend reachable only over the VPN:
+# requires_vpn = ["netbird"]
+
 # ── Expose: Read-only (port 9797) ───────────────────────────────────────
 [[expose]]
 port = 9797
@@ -57,6 +68,7 @@ tools_allow = ["slack_read_channel", "slack_read_thread", "slack_read_user_profi
 [[expose]]
 port = 9798
 label = "admin"
+# vpn = ["netbird"]          # expose hub.vpn_status / hub.vpn_login on this port
 [expose.backends.slack]      # all tools
 [expose.backends.atlassian]  # all tools
 [expose.backends.notion]     # all tools

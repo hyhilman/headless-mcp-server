@@ -411,6 +411,43 @@ impl BackendRegistry {
     pub fn backend_ids(&self) -> Vec<String> {
         self.backends.read().unwrap().keys().cloned().collect()
     }
+
+    /// Whether `exposed_name` is currently routable.
+    pub fn has_tool(&self, exposed_name: &str) -> bool {
+        self.tool_index.read().unwrap().contains_key(exposed_name)
+    }
+
+    /// The backend behind a tool and the VPNs that backend requires.
+    pub fn tool_requirements(&self, exposed_name: &str) -> Option<(String, Vec<String>)> {
+        let tool_index = self.tool_index.read().unwrap();
+        let routed = tool_index.get(exposed_name)?;
+        let backends = self.backends.read().unwrap();
+        let handle = backends.get(&routed.backend_id)?;
+        Some((routed.backend_id.clone(), handle.def.requires_vpn.clone()))
+    }
+
+    /// Backend ids that require the given VPN.
+    pub fn backends_requiring_vpn(&self, vpn: &str) -> Vec<String> {
+        self.backends
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, h)| h.def.requires_vpn.iter().any(|v| v == vpn))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Reconnect a backend now (e.g. after its VPN came back), resetting backoff.
+    pub async fn reconnect_backend(&self, id: &str) -> Result<(), BackendError> {
+        let backend = {
+            let backends = self.backends.read().unwrap();
+            backends.get(id).map(|h| h.backend.clone())
+        };
+        if let Some(backend) = backend {
+            let _ = backend.disconnect().await;
+        }
+        self.connect_backend(id).await
+    }
 }
 
 /// Compute the exposed (namespaced) name for a tool.
@@ -524,6 +561,7 @@ mod tests {
             stderr_mode: headless_mcp_core::StderrMode::LogOnError,
             tools_allow: vec![],
             tools_deny: vec![],
+            requires_vpn: vec![],
         }
     }
 

@@ -6,6 +6,7 @@ members = [
     "crates/registry",
     "crates/mcp-wire",
     "crates/mcp-server",
+    "crates/vpn",
     "crates/transport-stdio",
     "crates/transport-http",
     "crates/backends/backend-stdio",
