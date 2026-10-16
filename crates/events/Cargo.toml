@@ -1,0 +1,17 @@
+[package]
+name = "headless-mcp-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "MCP Events: event catalog, webhook subscriptions, Standard Webhooks delivery."
+
+[dependencies]
+headless-mcp-wire = { path = "../mcp-wire" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+base64 = "0.22"
+ring = "0.17"

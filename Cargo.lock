@@ -586,6 +586,7 @@ dependencies = [
  "headless-mcp-backend-http",
  "headless-mcp-backend-stdio",
  "headless-mcp-core",
+ "headless-mcp-events",
  "headless-mcp-registry",
  "headless-mcp-secrets",
  "headless-mcp-server",
@@ -649,6 +650,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "headless-mcp-events"
+version = "0.0.8"
+dependencies = [
+ "base64",
+ "headless-mcp-wire",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "headless-mcp-registry"
 version = "0.0.8"
 dependencies = [
@@ -686,6 +701,7 @@ dependencies = [
  "async-trait",
  "base64",
  "headless-mcp-core",
+ "headless-mcp-events",
  "headless-mcp-registry",
  "headless-mcp-vpn",
  "headless-mcp-wire",

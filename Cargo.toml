@@ -7,6 +7,7 @@ members = [
     "crates/mcp-wire",
     "crates/mcp-server",
     "crates/vpn",
+    "crates/events",
     "crates/transport-stdio",
     "crates/transport-http",
     "crates/backends/backend-stdio",

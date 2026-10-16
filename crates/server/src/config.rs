@@ -19,6 +19,31 @@ struct RawConfig {
     pub vpn: HashMap<String, RawVpnConfig>,
     #[serde(default)]
     pub notify: Vec<RawNotify>,
+    #[serde(default)]
+    pub events: Option<RawEvents>,
+}
+
+/// `[events]`: MCP Events (webhook subscriptions for VPN state changes).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEvents {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_events_ttl")]
+    pub default_ttl_secs: u64,
+    #[serde(default = "default_events_max_ttl")]
+    pub max_ttl_secs: u64,
+    #[serde(default)]
+    pub allow_insecure_callbacks: bool,
+    #[serde(default)]
+    pub include_login_url: bool,
+}
+
+fn default_events_ttl() -> u64 {
+    24 * 3600
+}
+fn default_events_max_ttl() -> u64 {
+    7 * 24 * 3600
 }
 
 /// `[[notify]]`: where VPN alerts go.
@@ -188,6 +213,8 @@ pub struct HubConfig {
     pub notify: Vec<NotifyTarget>,
     /// VPN names with `auto_login = true`.
     pub vpn_auto_login: Vec<String>,
+    /// `Some` when `[events] enabled = true`. `store_path` is filled in by the caller.
+    pub events: Option<headless_mcp_events::EventsConfig>,
 }
 
 /// One HTTP listener exposing a subset of backends.
@@ -445,5 +472,15 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
         .map(|(name, _)| name.clone())
         .collect();
 
-    Ok(HubConfig { auth, backends, expose, vpn, notify, vpn_auto_login })
+    let events = raw_config.events.as_ref().filter(|e| e.enabled).map(|e| {
+        headless_mcp_events::EventsConfig {
+            store_path: None,
+            default_ttl_secs: e.default_ttl_secs,
+            max_ttl_secs: e.max_ttl_secs.max(e.default_ttl_secs),
+            allow_insecure_callbacks: e.allow_insecure_callbacks,
+            include_login_url: e.include_login_url,
+        }
+    });
+
+    Ok(HubConfig { auth, backends, expose, vpn, notify, vpn_auto_login, events })
 }

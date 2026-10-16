@@ -420,12 +420,25 @@ impl BackendRegistry {
     }
 
     /// The backend behind a tool and the VPNs that backend requires.
+    ///
+    /// Tools of a backend that never connected (e.g. its VPN was down at
+    /// startup) are not indexed yet; they are matched by namespace prefix
+    /// (`<namespace>.<tool>`) so callers still learn which VPN is missing.
     pub fn tool_requirements(&self, exposed_name: &str) -> Option<(String, Vec<String>)> {
-        let tool_index = self.tool_index.read().unwrap();
-        let routed = tool_index.get(exposed_name)?;
         let backends = self.backends.read().unwrap();
-        let handle = backends.get(&routed.backend_id)?;
-        Some((routed.backend_id.clone(), handle.def.requires_vpn.clone()))
+        if let Some(routed) = self.tool_index.read().unwrap().get(exposed_name) {
+            let handle = backends.get(&routed.backend_id)?;
+            return Some((routed.backend_id.clone(), handle.def.requires_vpn.clone()));
+        }
+        backends
+            .iter()
+            .find(|(_, h)| {
+                !h.def.requires_vpn.is_empty()
+                    && h.def.namespace.as_deref().is_some_and(|ns| {
+                        exposed_name.strip_prefix(ns).is_some_and(|rest| rest.starts_with('.'))
+                    })
+            })
+            .map(|(id, h)| (id.clone(), h.def.requires_vpn.clone()))
     }
 
     /// Backend ids that require the given VPN.

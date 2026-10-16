@@ -298,6 +298,12 @@ impl McpSession {
                 )));
             }
             if self.wait_for_vpn(manager, &block.vpn).await {
+                // The backend may not have reconnected yet; don't race it.
+                if !self.registry.has_tool(&params.name) {
+                    if let Err(e) = self.registry.reconnect_backend(&block.backend).await {
+                        tracing::warn!(backend = %block.backend, %e, "reconnect after VPN login failed");
+                    }
+                }
                 return None;
             }
         }

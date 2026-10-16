@@ -15,6 +15,7 @@ headless-mcp-core = { path = "../core" }
 headless-mcp-secrets = { path = "../secrets" }
 headless-mcp-registry = { path = "../registry" }
 headless-mcp-vpn = { path = "../vpn" }
+headless-mcp-events = { path = "../events" }
 headless-mcp-wire = { path = "../mcp-wire" }
 headless-mcp-server = { path = "../mcp-server" }
 headless-mcp-transport-stdio = { path = "../transport-stdio" }

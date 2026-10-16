@@ -11,6 +11,7 @@ headless-mcp-wire = { path = "../mcp-wire" }
 headless-mcp-registry = { path = "../registry" }
 headless-mcp-core = { path = "../core" }
 headless-mcp-vpn = { path = "../vpn" }
+headless-mcp-events = { path = "../events" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

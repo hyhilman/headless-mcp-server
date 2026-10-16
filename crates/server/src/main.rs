@@ -14,6 +14,7 @@ use headless_mcp_core::{BackendTransport, McpBackend};
 use headless_mcp_registry::BackendRegistry;
 use headless_mcp_server::{McpSession, TracingAuditLogger};
 use headless_mcp_secrets::EncryptedFileSecretStore;
+use headless_mcp_events::{EventHub, VpnStateEvent};
 use headless_mcp_vpn::{LoginOutcome, VpnEvent, VpnManager, VpnState};
 
 use config::load_config;
@@ -138,9 +139,40 @@ fn bind_addr(bind: Option<String>, port: u16) -> SocketAddr {
     format!("127.0.0.1:{port}").parse().unwrap()
 }
 
+fn data_dir() -> std::path::PathBuf {
+    std::env::var("HEADLESS_MCP_DATA_DIR").unwrap_or_else(|_| ".".into()).into()
+}
+
+fn session_vpn_empty(session: &McpSession) -> bool {
+    session.exposed_vpns().is_empty()
+}
+
+/// Publish VPN state changes as MCP Events.
+fn spawn_event_publisher(vpn: &Arc<VpnManager>, hub: Arc<EventHub>) {
+    let mut events = vpn.subscribe();
+    let vpn = vpn.clone();
+    tokio::spawn(async move {
+        loop {
+            let VpnEvent::StateChanged { name, from, to } = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if from == VpnState::Unknown && to == VpnState::Connected {
+                continue;
+            }
+            if to == VpnState::NeedsLogin {
+                // Give auto_login (if configured) a moment to produce the link.
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            let login_url = vpn.status(&name).and_then(|s| s.login).map(|l| l.url);
+            hub.publish(VpnStateEvent { vpn: name, from: from.to_string(), to: to.to_string(), login_url });
+        }
+    });
+}
+
 fn build_token_store() -> Option<Arc<EncryptedFileSecretStore>> {
-    let data_dir = std::env::var("HEADLESS_MCP_DATA_DIR").unwrap_or_else(|_| ".".into());
-    let path = std::path::Path::new(&data_dir).join("secrets.json");
+    let path = data_dir().join("secrets.json");
     match EncryptedFileSecretStore::from_env(path) {
         Ok(s) => {
             tracing::debug!("token store ready");
@@ -172,8 +204,21 @@ async fn run_serve(
     if !vpn.is_empty() {
         // Subscribe before the first check so its result can trigger alerts.
         notify::spawn_notifier(vpn.clone(), cfg.notify.clone(), cfg.vpn_auto_login.clone());
+    }
+    let events = cfg.events.clone().filter(|_| !vpn.is_empty()).map(|mut ec| {
+        ec.store_path = Some(data_dir().join("events.json"));
+        let hub = EventHub::new(ec, vpn.names());
+        spawn_event_publisher(&vpn, hub.clone());
+        hub
+    });
+    if !vpn.is_empty() {
         vpn.start_watchers();
     }
+    // Sessions that expose VPN tools also serve MCP Events.
+    let attach_events = |session: McpSession| match &events {
+        Some(hub) if !session_vpn_empty(&session) => session.with_events(hub.clone()),
+        _ => session,
+    };
 
     // If expose blocks exist, start one HTTP server per port
     if !cfg.expose.is_empty() {
@@ -192,9 +237,9 @@ async fn run_serve(
             for (id, r) in &reg.connect_all().await {
                 if let Err(e) = r { tracing::warn!(%id, %label, %e, "connect failed"); }
             }
-            let session = Arc::new(
+            let session = Arc::new(attach_events(
                 McpSession::new(reg.clone(), Arc::new(TracingAuditLogger)).with_vpn(vpn.clone(), eb.vpn.clone()),
-            );
+            ));
             spawn_vpn_reconnect(&vpn, reg, session.clone());
             let token = hub_token.clone();
             tracing::info!(%label, %addr, "starting expose");
@@ -220,9 +265,9 @@ async fn run_serve(
     for (id, r) in &reg.connect_all().await {
         if let Err(e) = r { tracing::warn!(%id, %e, "connect failed"); }
     }
-    let session = Arc::new(
+    let session = Arc::new(attach_events(
         McpSession::new(reg.clone(), Arc::new(TracingAuditLogger)).with_vpn(vpn.clone(), vpn.names()),
-    );
+    ));
     spawn_vpn_reconnect(&vpn, reg, session.clone());
     if http {
         let token = cfg.auth.as_ref().and_then(|a| a.hub_token.clone())

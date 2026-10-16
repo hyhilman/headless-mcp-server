@@ -54,6 +54,7 @@ pub struct McpSession {
     pub(crate) state_signer: crate::request_state::StateSigner,
     /// How long a retried call waits for a VPN login to finish.
     pub(crate) login_wait: Duration,
+    events: Option<Arc<headless_mcp_events::EventHub>>,
 }
 
 impl McpSession {
@@ -67,13 +68,25 @@ impl McpSession {
             changes: tokio::sync::broadcast::channel(64).0,
             state_signer: crate::request_state::StateSigner::new(),
             login_wait: Duration::from_secs(20),
+            events: None,
         }
+    }
+
+    /// Serve MCP Events (`events/list`, `events/subscribe`, `events/unsubscribe`).
+    pub fn with_events(mut self, hub: Arc<headless_mcp_events::EventHub>) -> Self {
+        self.events = Some(hub);
+        self
     }
 
     /// How long a retried call waits for a pending VPN login to finish.
     pub fn with_login_wait(mut self, wait: Duration) -> Self {
         self.login_wait = wait;
         self
+    }
+
+    /// VPN names exposed through this session's `hub.vpn_*` tools.
+    pub fn exposed_vpns(&self) -> &[String] {
+        &self.vpn_tools
     }
 
     /// Tell `subscriptions/listen` streams that the tool list changed
@@ -154,6 +167,9 @@ impl McpSession {
             "tools/call" => self.handle_tools_call(request.params.clone(), &ctx).await,
             "resources/list" => self.simple(self.handle_resources_list(&ctx)),
             "resources/read" => self.simple(self.handle_resources_read(request.params.as_ref(), &ctx)),
+            "events/list" | "events/subscribe" | "events/unsubscribe" if self.events.is_some() => {
+                self.simple(self.handle_events(&request.method, request.params.as_ref(), &ctx).await)
+            }
             "subscriptions/listen" => self.simple(Err(JsonRpcError::invalid_request(
                 "subscriptions/listen needs a streaming transport",
             ))),
@@ -182,7 +198,25 @@ impl McpSession {
         if !self.vpn_tools.is_empty() {
             caps["resources"] = serde_json::json!({ "subscribe": true, "listChanged": false });
         }
+        if self.events.is_some() {
+            caps["events"] = serde_json::json!({});
+        }
         caps
+    }
+
+    async fn handle_events(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+        ctx: &RequestCtx,
+    ) -> Result<Value, JsonRpcError> {
+        self.require_initialized(ctx)?;
+        let hub = self.events.as_ref().ok_or_else(|| JsonRpcError::method_not_found(method))?;
+        match method {
+            "events/list" => Ok(hub.list()),
+            "events/subscribe" => hub.subscribe(params).await,
+            _ => hub.unsubscribe(params),
+        }
     }
 
     fn handle_discover(&self) -> Value {
@@ -774,6 +808,33 @@ mod tests {
         })).await;
         assert_eq!(declined["isError"], true);
         assert!(declined["content"][0]["text"].as_str().unwrap().contains("declined"));
+    }
+
+    #[tokio::test]
+    async fn events_methods_only_when_enabled() {
+        let (session, _) = vpn_session("echo ok", true).await;
+        let params = modern_params(serde_json::json!({}));
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(1, "events/list", Some(params.clone()))))
+            .await
+            .unwrap();
+        assert!(matches!(reply, JsonRpcMessage::ErrorResponse(_)));
+
+        let hub = headless_mcp_events::EventHub::new(Default::default(), vec!["netbird".into()]);
+        let session = session.with_events(hub);
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(2, "events/list", Some(params.clone()))))
+            .await
+            .unwrap();
+        let JsonRpcMessage::SuccessResponse(ok) = reply else { panic!("{reply:?}") };
+        assert_eq!(ok.result["events"][0]["name"], "vpn.state_changed");
+
+        let reply = session
+            .handle(JsonRpcMessage::Request(request(3, "server/discover", Some(params))))
+            .await
+            .unwrap();
+        let JsonRpcMessage::SuccessResponse(ok) = reply else { panic!("{reply:?}") };
+        assert!(ok.result["capabilities"]["events"].is_object());
     }
 
     #[tokio::test]
