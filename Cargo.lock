@@ -593,6 +593,7 @@ dependencies = [
  "headless-mcp-transport-stdio",
  "headless-mcp-vpn",
  "headless-mcp-wire",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

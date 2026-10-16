@@ -1,5 +1,7 @@
 use headless_mcp_core::{BackendDef, BackendTransport, ConnectionMode, StderrMode};
 use headless_mcp_vpn::VpnDef;
+
+use crate::notify::{NotifyKind, NotifyTarget};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,6 +17,22 @@ struct RawConfig {
     pub expose: Vec<RawExposeBlock>,
     #[serde(default)]
     pub vpn: HashMap<String, RawVpnConfig>,
+    #[serde(default)]
+    pub notify: Vec<RawNotify>,
+}
+
+/// `[[notify]]`: where VPN alerts go.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNotify {
+    pub kind: NotifyKind,
+    pub url: String,
+    #[serde(default = "default_notify_on")]
+    pub on: Vec<String>,
+}
+
+fn default_notify_on() -> Vec<String> {
+    vec!["needs_login".into(), "down".into(), "connected".into()]
 }
 
 /// `[vpn.<name>]`: fixed commands only. Nothing here can be supplied by a caller.
@@ -41,6 +59,10 @@ struct RawVpnConfig {
     pub login_timeout_secs: u64,
     #[serde(default)]
     pub callback_ports: Vec<u16>,
+    /// Start the login as soon as the VPN needs it and include the link in
+    /// `[[notify]]` alerts.
+    #[serde(default)]
+    pub auto_login: bool,
 }
 
 fn default_url_prefixes() -> Vec<String> {
@@ -163,6 +185,9 @@ pub struct HubConfig {
     /// If empty, serve uses stdio or single HTTP with all backends.
     pub expose: Vec<ExposeBlock>,
     pub vpn: Vec<VpnDef>,
+    pub notify: Vec<NotifyTarget>,
+    /// VPN names with `auto_login = true`.
+    pub vpn_auto_login: Vec<String>,
 }
 
 /// One HTTP listener exposing a subset of backends.
@@ -406,5 +431,19 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
         });
     }
 
-    Ok(HubConfig { auth, backends, expose, vpn })
+    let mut notify = Vec::new();
+    for n in &raw_config.notify {
+        if let Some(bad) = n.on.iter().find(|s| !matches!(s.as_str(), "needs_login" | "down" | "connected")) {
+            return Err(format!("notify: unknown state '{bad}' in 'on' (use needs_login, down, connected)").into());
+        }
+        notify.push(NotifyTarget { kind: n.kind, url: resolve_value(&n.url), on: n.on.clone() });
+    }
+    let vpn_auto_login = raw_config
+        .vpn
+        .iter()
+        .filter(|(_, v)| v.auto_login)
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    Ok(HubConfig { auth, backends, expose, vpn, notify, vpn_auto_login })
 }

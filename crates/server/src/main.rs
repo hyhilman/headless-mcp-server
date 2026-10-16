@@ -2,6 +2,7 @@
 //! configured MCP hub.
 
 mod config;
+mod notify;
 mod one_shot;
 
 use std::net::SocketAddr;
@@ -169,6 +170,8 @@ async fn run_serve(
 
     let vpn = VpnManager::new(cfg.vpn.clone());
     if !vpn.is_empty() {
+        // Subscribe before the first check so its result can trigger alerts.
+        notify::spawn_notifier(vpn.clone(), cfg.notify.clone(), cfg.vpn_auto_login.clone());
         vpn.start_watchers();
     }
 
