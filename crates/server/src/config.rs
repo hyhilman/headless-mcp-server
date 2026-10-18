@@ -70,6 +70,18 @@ struct RawBackendConfig {
     pub tools_allow: Vec<String>,
     #[serde(default)]
     pub tools_deny: Vec<String>,
+    /// Tool arguments always set by the hub (removed from schemas).
+    #[serde(default)]
+    pub pin_args: toml::Table,
+    /// Tool arguments callers may not set (removed from schemas).
+    #[serde(default)]
+    pub deny_args: Vec<String>,
+    /// Appended to errors when this backend is unreachable.
+    #[serde(default)]
+    pub unavailable_hint: Option<String>,
+    /// Forward modern clients' request metadata on tools/call.
+    #[serde(default)]
+    pub forward_request_meta: bool,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -309,6 +321,13 @@ pub fn load_config(explicit: Option<&str>) -> Result<HubConfig, Box<dyn std::err
             stderr_mode,
             tools_allow: bc.tools_allow.clone(),
             tools_deny: bc.tools_deny.clone(),
+            unavailable_hint: bc.unavailable_hint.clone(),
+            forward_request_meta: bc.forward_request_meta,
+            pin_args: match serde_json::to_value(&bc.pin_args)? {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            },
+            deny_args: bc.deny_args.clone(),
         });
     }
 

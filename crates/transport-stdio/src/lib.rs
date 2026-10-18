@@ -6,12 +6,15 @@
 //! a locally-spawned MCP client (an editor, a CLI harness) talks: stdin is
 //! implicitly trusted the way any process the user launched is.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
-use headless_mcp_server::McpSession;
+use headless_mcp_server::{McpSession, SessionReply};
 use headless_mcp_wire::{decode_message, JsonRpcErrorResponse, JsonRpcMessage};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// Runs the stdio transport to completion: reads newline-delimited
 /// JSON-RPC messages from stdin, dispatches each through `session`, and
@@ -19,22 +22,36 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 ///
 /// A single malformed line never stops the loop: a line that fails to
 /// decode gets a JSON-RPC error reply (`id: null`) and reading continues.
+///
+/// `subscriptions/listen` streams share stdout with replies; each stream
+/// runs until the client sends `notifications/cancelled` for its request id
+/// or stdin closes.
 pub async fn run_stdio(session: Arc<McpSession>) -> io::Result<()> {
     run(session, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
 /// The testable core of [`run_stdio`], generic over the input/output streams.
-async fn run<R, W>(session: Arc<McpSession>, reader: R, mut writer: W) -> io::Result<()>
+async fn run<R, W>(session: Arc<McpSession>, reader: R, writer: W) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<JsonRpcMessage>();
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(message) = out_rx.recv().await {
+            write_reply(&mut writer, &message).await?;
+        }
+        Ok::<(), io::Error>(())
+    });
+
+    let mut streams: HashMap<String, JoinHandle<()>> = HashMap::new();
     let mut lines = BufReader::new(reader).lines();
 
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
-            Ok(None) => return Ok(()),
+            Ok(None) => break,
             Err(error) => {
                 tracing::warn!(%error, "failed to read a line from stdin; skipping it");
                 continue;
@@ -47,19 +64,56 @@ where
 
         tracing::trace!(%line, "received stdio line");
 
-        let reply = match decode_message(line.as_bytes()) {
-            Ok(message) => session.handle(message).await,
-            Err(error) => Some(JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse::new(
-                None, error,
-            ))),
+        let message = match decode_message(line.as_bytes()) {
+            Ok(message) => message,
+            Err(error) => {
+                let _ = out_tx.send(JsonRpcMessage::ErrorResponse(JsonRpcErrorResponse::new(
+                    None, error,
+                )));
+                continue;
+            }
         };
 
-        let Some(reply) = reply else {
-            continue;
-        };
+        if let JsonRpcMessage::Notification(n) = &message {
+            if n.method == "notifications/cancelled" {
+                if let Some(id) = n.params.as_ref().and_then(|p| p.get("requestId")) {
+                    if let Some(handle) = streams.remove(&id.to_string()) {
+                        handle.abort();
+                    }
+                }
+            }
+        }
 
-        write_reply(&mut writer, &reply).await?;
+        match session.handle_streaming(message).await {
+            Some(SessionReply::Message(reply)) => {
+                let _ = out_tx.send(reply);
+            }
+            Some(SessionReply::Stream { id, mut messages }) => {
+                let tx = out_tx.clone();
+                let handle = tokio::spawn(async move {
+                    while let Some(message) = messages.recv().await {
+                        if tx.send(message).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let key = serde_json::to_value(&id).map(|v| v.to_string()).unwrap_or_default();
+                streams.insert(key, handle);
+            }
+            None => {}
+        }
     }
+
+    for handle in streams.values() {
+        handle.abort();
+    }
+    for (_, handle) in streams {
+        let _ = handle.await;
+    }
+    drop(out_tx);
+    writer_task
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e)))
 }
 
 async fn write_reply<W>(writer: &mut W, reply: &JsonRpcMessage) -> io::Result<()>
@@ -194,5 +248,44 @@ mod tests {
         assert_eq!(replies.len(), 2);
         assert_eq!(replies[0]["id"], 1);
         assert_eq!(replies[1]["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn listen_stream_interleaves_notifications_until_cancelled() {
+        let (mut input_tx, input_rx) = tokio::io::duplex(64 * 1024);
+        let (output_tx, mut output_rx) = tokio::io::duplex(64 * 1024);
+        let session = test_session();
+        let handle = tokio::spawn({
+            let session = session.clone();
+            async move { run(session, input_rx, output_tx).await }
+        });
+
+        let listen = json!({
+            "jsonrpc": "2.0", "id": 7, "method": "subscriptions/listen",
+            "params": {
+                "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"},
+                "notifications": {"toolsListChanged": true, "promptsListChanged": true}
+            }
+        });
+        input_tx.write_all(format!("{listen}\n").as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        session.notify_tools_list_changed();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let cancel = json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}});
+        input_tx.write_all(format!("{cancel}\n").as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        session.notify_tools_list_changed(); // after cancel: not delivered
+        drop(input_tx);
+        handle.await.unwrap().unwrap();
+
+        let mut collected = String::new();
+        output_rx.read_to_string(&mut collected).await.unwrap();
+        let lines = parse_lines(&collected);
+        assert_eq!(lines.len(), 2, "{collected}");
+        assert_eq!(lines[0]["method"], "notifications/subscriptions/acknowledged");
+        assert_eq!(lines[0]["params"]["notifications"], json!({"toolsListChanged": true}));
+        assert_eq!(lines[1]["method"], "notifications/tools/list_changed");
+        assert_eq!(lines[1]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 7);
     }
 }

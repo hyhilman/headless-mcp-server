@@ -4,7 +4,8 @@
 //! health checks, reconnect with exponential backoff, and connection modes.
 
 use headless_mcp_core::{
-    BackendDef, BackendError, BackendErrorKind, ConnectionMode, McpBackend, ToolDescriptor,
+    BackendDef, BackendError, BackendErrorKind, ConnectionMode, McpBackend, ServerCapabilities,
+    ToolDescriptor,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -22,6 +23,8 @@ struct BackendHandle {
     def: BackendDef,
     backend: Arc<dyn McpBackend>,
     health: AtomicBool,
+    /// Capabilities from the backend's last successful `initialize`.
+    capabilities: std::sync::Mutex<Option<ServerCapabilities>>,
     /// For eager/lazy backends: current reconnect attempt count (for backoff)
     reconnect_attempts: std::sync::Mutex<u32>,
 }
@@ -62,6 +65,7 @@ impl BackendRegistry {
             def,
             backend,
             health: AtomicBool::new(false),
+            capabilities: std::sync::Mutex::new(None),
             reconnect_attempts: std::sync::Mutex::new(0),
         };
 
@@ -119,7 +123,7 @@ impl BackendRegistry {
 
     /// Connect a specific backend and index its tools.
     async fn connect_backend(&self, id: &str) -> Result<(), BackendError> {
-        let (backend, namespace, _connection_mode, tools_allow, tools_deny) = {
+        let (backend, namespace, _connection_mode, tools_allow, tools_deny, hidden_args) = {
             let backends = self.backends.read().unwrap();
             let handle = backends.get(id).ok_or_else(|| {
                 BackendError::new(
@@ -133,11 +137,15 @@ impl BackendRegistry {
                 handle.def.connection_mode,
                 handle.def.tools_allow.clone(),
                 handle.def.tools_deny.clone(),
+                hidden_args(&handle.def),
             )
         };
 
         // Full MCP handshake
-        backend.connect().await?;
+        let init = backend.connect().await?;
+        if let Some(handle) = self.backends.read().unwrap().get(id) {
+            *handle.capabilities.lock().unwrap() = Some(init.capabilities);
+        }
 
         // Fetch tools
         let mut tools = backend.list_tools().await?;
@@ -179,7 +187,7 @@ impl BackendRegistry {
                     descriptor: ToolDescriptor {
                         name: exposed_name,
                         description: tool.description.clone(),
-                        input_schema: tool.input_schema.clone(),
+                        input_schema: strip_schema_args(&tool.input_schema, &hidden_args),
                     },
                 },
             );
@@ -329,7 +337,19 @@ impl BackendRegistry {
         args: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, BackendError> {
-        let (backend_id, backend, downstream_name, mode) = {
+        self.route_call_with(exposed_name, args, serde_json::Map::new(), timeout).await
+    }
+
+    /// [`route_call`](Self::route_call) with extra `tools/call` params
+    /// (`_meta`, `requestState`, `inputResponses`) merged in.
+    pub async fn route_call_with(
+        &self,
+        exposed_name: &str,
+        args: Option<Value>,
+        extra: serde_json::Map<String, Value>,
+        timeout: Duration,
+    ) -> Result<Value, BackendError> {
+        let (backend_id, backend, downstream_name, mode, args) = {
             let tool_index = self.tool_index.read().unwrap();
             let routed = tool_index
                 .get(exposed_name)
@@ -356,6 +376,7 @@ impl BackendRegistry {
                 handle.backend.clone(),
                 routed.downstream_name.clone(),
                 handle.def.connection_mode,
+                apply_arg_policy(&handle.def, args)?,
             )
         };
 
@@ -375,15 +396,28 @@ impl BackendRegistry {
             }
         }
 
+        let call = || async {
+            if extra.is_empty() {
+                return backend.call_tool(&downstream_name, args.clone(), timeout).await;
+            }
+            let mut params = extra.clone();
+            params.insert("name".into(), Value::String(downstream_name.clone()));
+            params.insert(
+                "arguments".into(),
+                args.clone().unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+            );
+            backend.request("tools/call", Some(Value::Object(params)), timeout).await
+        };
+
         // Handle per-call: connect, call, disconnect
         if matches!(mode, ConnectionMode::PerCall) {
             backend.connect().await?;
-            let result = backend.call_tool(&downstream_name, args, timeout).await;
+            let result = call().await;
             backend.disconnect().await?;
             return result;
         }
 
-        backend.call_tool(&downstream_name, args, timeout).await
+        call().await
     }
 
     /// Refresh tools from all healthy backends.
@@ -411,6 +445,152 @@ impl BackendRegistry {
     pub fn backend_ids(&self) -> Vec<String> {
         self.backends.read().unwrap().keys().cloned().collect()
     }
+
+    /// Whether `exposed_name` is currently routable.
+    pub fn has_tool(&self, exposed_name: &str) -> bool {
+        self.tool_index.read().unwrap().contains_key(exposed_name)
+    }
+
+    /// The backend serving `exposed_name`.
+    ///
+    /// Tools of a backend that is not connected (e.g. it was unreachable at
+    /// startup) are not indexed; they are matched by namespace prefix
+    /// (`<namespace>.<tool>`), so callers can reconnect it or explain why
+    /// the tool is missing.
+    pub fn backend_of_tool(&self, exposed_name: &str) -> Option<String> {
+        if let Some(routed) = self.tool_index.read().unwrap().get(exposed_name) {
+            return Some(routed.backend_id.clone());
+        }
+        self.backends
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(_, h)| {
+                h.def.namespace.as_deref().is_some_and(|ns| {
+                    exposed_name.strip_prefix(ns).is_some_and(|rest| rest.starts_with('.'))
+                })
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Whether the backend passed its last connect / health check.
+    pub fn is_healthy(&self, id: &str) -> bool {
+        self.backends.read().unwrap().get(id).is_some_and(|h| h.health.load(Ordering::SeqCst))
+    }
+
+    /// The backend's `unavailable_hint`, if configured.
+    pub fn unavailable_hint(&self, id: &str) -> Option<String> {
+        self.backends.read().unwrap().get(id).and_then(|h| h.def.unavailable_hint.clone())
+    }
+
+    /// Whether `tools/call` to this backend carries the client's 2026-07-28
+    /// request metadata.
+    pub fn forwards_request_meta(&self, id: &str) -> bool {
+        self.backends.read().unwrap().get(id).is_some_and(|h| h.def.forward_request_meta)
+    }
+
+    /// The backend's namespace, if any.
+    pub fn namespace(&self, id: &str) -> Option<String> {
+        self.backends.read().unwrap().get(id).and_then(|h| h.def.namespace.clone())
+    }
+
+    /// Connected backends that advertised a capability (`resources`,
+    /// `events`), sorted by id.
+    pub fn backends_with(&self, capability: &str) -> Vec<String> {
+        let backends = self.backends.read().unwrap();
+        let mut ids: Vec<String> = backends
+            .iter()
+            .filter(|(_, h)| h.health.load(Ordering::SeqCst))
+            .filter(|(_, h)| {
+                h.capabilities.lock().unwrap().as_ref().is_some_and(|c| match capability {
+                    "resources" => c.resources.is_some(),
+                    "events" => c.events.is_some(),
+                    "tools" => c.tools.is_some(),
+                    _ => false,
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Send any request to one backend.
+    pub async fn backend_request(
+        &self,
+        id: &str,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, BackendError> {
+        let backend = self
+            .backends
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|h| h.backend.clone())
+            .ok_or_else(|| BackendError::new(BackendErrorKind::Internal, format!("unknown backend '{id}'")))?;
+        backend.request(method, params, timeout).await
+    }
+
+    /// Reconnect a backend now (e.g. it was unreachable until a login).
+    pub async fn reconnect_backend(&self, id: &str) -> Result<(), BackendError> {
+        let backend = {
+            let backends = self.backends.read().unwrap();
+            backends.get(id).map(|h| h.backend.clone())
+        };
+        if let Some(backend) = backend {
+            let _ = backend.disconnect().await;
+        }
+        self.connect_backend(id).await
+    }
+}
+
+/// Argument names hidden from callers: pinned plus denied.
+fn hidden_args(def: &BackendDef) -> Vec<String> {
+    def.pin_args.keys().cloned().chain(def.deny_args.iter().cloned()).collect()
+}
+
+/// Remove `hidden` from a JSON schema's `properties` and `required`.
+fn strip_schema_args(schema: &Value, hidden: &[String]) -> Value {
+    let mut schema = schema.clone();
+    if hidden.is_empty() {
+        return schema;
+    }
+    if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        props.retain(|k, _| !hidden.contains(k));
+    }
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|v| !v.as_str().is_some_and(|k| hidden.iter().any(|h| h == k)));
+    }
+    schema
+}
+
+/// Reject denied arguments, then force pinned ones.
+fn apply_arg_policy(def: &BackendDef, args: Option<Value>) -> Result<Option<Value>, BackendError> {
+    if def.pin_args.is_empty() && def.deny_args.is_empty() {
+        return Ok(args);
+    }
+    let mut obj = match args {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(obj)) => obj,
+        Some(_) => {
+            return Err(BackendError::new(
+                BackendErrorKind::Protocol,
+                "tool arguments must be an object",
+            ))
+        }
+    };
+    if let Some(denied) = def.deny_args.iter().find(|k| obj.contains_key(k.as_str())) {
+        return Err(BackendError::new(
+            BackendErrorKind::Protocol,
+            format!("argument '{denied}' is not allowed for backend '{}'", def.id),
+        ));
+    }
+    for (k, v) in &def.pin_args {
+        obj.insert(k.clone(), v.clone());
+    }
+    Ok(Some(Value::Object(obj)))
 }
 
 /// Compute the exposed (namespaced) name for a tool.
@@ -465,6 +645,7 @@ mod tests {
                     tools: None,
                     resources: None,
                     prompts: None,
+                    events: None,
                 },
             })
         }
@@ -476,10 +657,10 @@ mod tests {
         async fn call_tool(
             &self,
             name: &str,
-            _arguments: Option<Value>,
+            arguments: Option<Value>,
             _timeout: Duration,
         ) -> BackendResult<Value> {
-            Ok(serde_json::json!({"called": name, "backend": self.id}))
+            Ok(serde_json::json!({"called": name, "backend": self.id, "args": arguments}))
         }
 
         async fn disconnect(&self) -> BackendResult<()> {
@@ -524,6 +705,10 @@ mod tests {
             stderr_mode: headless_mcp_core::StderrMode::LogOnError,
             tools_allow: vec![],
             tools_deny: vec![],
+            unavailable_hint: None,
+            forward_request_meta: false,
+            pin_args: serde_json::Map::new(),
+            deny_args: vec![],
         }
     }
 
@@ -563,5 +748,51 @@ mod tests {
 
         assert_eq!(result["called"], "send_message");
         assert_eq!(result["backend"], "slack");
+    }
+
+    #[tokio::test]
+    async fn pinned_and_denied_args_are_enforced_and_hidden() {
+        let registry = BackendRegistry::new();
+        let mut tool = make_tool("list_buckets");
+        tool.input_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "profile": {"type": "string"},
+                "account_id": {"type": "string"},
+                "prefix": {"type": "string"}
+            },
+            "required": ["profile", "prefix"]
+        });
+        let mut def = make_def("aws", Some("aws"));
+        def.pin_args.insert("profile".into(), serde_json::json!("prod"));
+        def.deny_args = vec!["account_id".into()];
+        registry
+            .register(def, Arc::new(MockBackend::new("aws", vec![tool])))
+            .await
+            .unwrap();
+        registry.connect_backend("aws").await.unwrap();
+
+        let schema = &registry.aggregated_tools()[0].input_schema;
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
+        assert_eq!(schema["required"], serde_json::json!(["prefix"]));
+
+        let result = registry
+            .route_call(
+                "aws.list_buckets",
+                Some(serde_json::json!({"profile": "admin", "prefix": "x"})),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["args"], serde_json::json!({"profile": "prod", "prefix": "x"}));
+
+        let denied = registry
+            .route_call(
+                "aws.list_buckets",
+                Some(serde_json::json!({"account_id": "123"})),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(denied.is_err());
     }
 }
