@@ -1,0 +1,30 @@
+# Image for prebuilt release binaries (see .github/workflows/publish.yml).
+# The build context holds <arch>/headless-mcp, one per TARGETARCH.
+# For building from source, use Dockerfile.
+
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --shell /usr/sbin/nologin headless-mcp \
+    && mkdir -p /data \
+    && chown headless-mcp:headless-mcp /data
+
+COPY ${TARGETARCH}/headless-mcp /usr/local/bin/headless-mcp
+
+USER headless-mcp
+WORKDIR /home/headless-mcp
+VOLUME ["/data"]
+
+# HEADLESS_MCP_TOKEN: required for HTTP mode. Set at docker run time.
+# HEADLESS_MCP_MASTER_KEY: optional, enables OAuth2 token persistence.
+ENV HEADLESS_MCP_DATA_DIR=/data
+ENV RUST_LOG=info
+
+EXPOSE 9797
+
+ENTRYPOINT ["headless-mcp"]
+CMD ["serve", "--http"]

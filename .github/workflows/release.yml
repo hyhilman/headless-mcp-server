@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [master]
 
 permissions: {}
 
@@ -45,13 +45,12 @@ jobs:
           git push origin "$tag"
           echo "created=true" >> "$GITHUB_OUTPUT"
 
-  docker:
+  publish:
     needs: tag
     if: needs.tag.outputs.created == 'true'
     permissions:
-      contents: read
+      contents: write
       packages: write
-    uses: ./.github/workflows/docker-image.yml
+    uses: ./.github/workflows/publish.yml
     with:
-      ref: v${{ needs.tag.outputs.version }}
       version: v${{ needs.tag.outputs.version }}
