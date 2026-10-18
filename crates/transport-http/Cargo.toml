@@ -17,3 +17,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 governor.workspace = true
 subtle.workspace = true
+futures-util = { version = "0.3", default-features = false }

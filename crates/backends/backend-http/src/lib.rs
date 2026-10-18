@@ -459,6 +459,11 @@ impl McpBackend for HttpBackend {
         self.send_request("tools/call", Some(params), true).await
     }
 
+    async fn request(&self, method: &str, params: Option<Value>, _timeout: Duration) -> BackendResult<Value> {
+        self.check_connected()?;
+        self.send_request(method, params, true).await
+    }
+
     async fn disconnect(&self) -> BackendResult<()> {
         self.connected.store(false, Ordering::SeqCst);
         tracing::info!(backend_id = %self.def.id, "http backend disconnected");

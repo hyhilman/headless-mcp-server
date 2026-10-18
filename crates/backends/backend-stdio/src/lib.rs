@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, oneshot};
 
 use stderr_capture::StderrCapture;
@@ -30,6 +30,9 @@ use stderr_capture::StderrCapture;
 /// Shared state between the StdioBackend and the reader task.
 struct SharedState {
     stdin: Mutex<Option<ChildStdin>>,
+    /// Owned so the process lives as long as the connection (the command
+    /// uses `kill_on_drop`, so dropping this kills it).
+    child: Mutex<Option<Child>>,
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, BackendError>>>>,
     connected: AtomicBool,
     initialize_result: Mutex<Option<InitializeResult>>,
@@ -51,6 +54,7 @@ impl StdioBackend {
             def,
             state: Arc::new(SharedState {
                 stdin: Mutex::new(None),
+                child: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
                 connected: AtomicBool::new(false),
                 initialize_result: Mutex::new(None),
@@ -214,11 +218,12 @@ impl McpBackend for StdioBackend {
 
         let stderr = child.stderr.take();
 
-        // Store stdin
+        // Store stdin and keep the child alive (dropping it would kill it).
         {
             let mut stdin_guard = self.state.stdin.lock().await;
             *stdin_guard = Some(stdin);
         }
+        *self.state.child.lock().await = Some(child);
 
         // Spawn the response reader task
         let state = self.state.clone();
@@ -361,12 +366,25 @@ impl McpBackend for StdioBackend {
             .await
     }
 
+    async fn request(&self, method: &str, params: Option<Value>, timeout: Duration) -> BackendResult<Value> {
+        if !self.state.connected.load(Ordering::SeqCst) {
+            return Err(BackendError::new(
+                BackendErrorKind::Connection,
+                format!("backend '{}' is not connected", self.def.id),
+            ));
+        }
+        self.send_request(method, params, timeout).await
+    }
+
     async fn disconnect(&self) -> BackendResult<()> {
         self.state.connected.store(false, Ordering::SeqCst);
         // Drop stdin to signal EOF to the child
         {
             let mut stdin_guard = self.state.stdin.lock().await;
             *stdin_guard = None;
+        }
+        if let Some(mut child) = self.state.child.lock().await.take() {
+            let _ = child.kill().await;
         }
         tracing::info!(backend_id = %self.def.id, "stdio backend disconnected");
         Ok(())

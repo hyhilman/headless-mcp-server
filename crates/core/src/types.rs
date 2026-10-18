@@ -47,6 +47,28 @@ pub struct BackendDef {
     /// Applied after tools_allow.
     #[serde(default)]
     pub tools_deny: Vec<String>,
+
+    /// Appended to errors when this backend is unreachable, e.g.
+    /// "Needs the VPN: call netbird.netbird_login first".
+    #[serde(default)]
+    pub unavailable_hint: Option<String>,
+
+    /// The backend understands MCP 2026-07-28 per-request metadata. Modern
+    /// clients' `_meta`, `requestState` and `inputResponses` are forwarded
+    /// on `tools/call`, so its login prompts (`input_required`) reach the
+    /// client.
+    #[serde(default)]
+    pub forward_request_meta: bool,
+
+    /// Tool arguments the hub always sets, overriding whatever the caller
+    /// sends (e.g. `profile = "prod"`). Removed from advertised schemas.
+    #[serde(default)]
+    pub pin_args: serde_json::Map<String, Value>,
+
+    /// Tool arguments callers may not send; calls including them are
+    /// rejected. Removed from advertised schemas.
+    #[serde(default)]
+    pub deny_args: Vec<String>,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -158,6 +180,9 @@ pub struct ServerCapabilities {
     pub resources: Option<ResourcesCapability>,
     #[serde(default)]
     pub prompts: Option<PromptsCapability>,
+    /// MCP Events (`events/list`, `events/subscribe`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

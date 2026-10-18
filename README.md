@@ -215,6 +215,49 @@ headless-mcp auth atlassian
 | `connect_timeout_secs` | Timeout for the initialize handshake (default: 10) |
 | `call_timeout_secs` | Timeout for each tool call (default: 30) |
 | `stderr_mode` | `"log-on-error"`, `"silent"`, `"passthrough"`, `"log-always"` |
+| `tools_allow` / `tools_deny` | Expose only / hide these tools (downstream names) |
+| `pin_args` | Arguments the hub always sets, e.g. `{ profile = "prod" }`; hidden from schemas, caller values ignored |
+| `deny_args` | Arguments callers may not set; hidden from schemas, calls using them are rejected |
+| `unavailable_hint` | Appended to errors when the backend is unreachable, e.g. `"Needs the VPN: call netbird.netbird_login"` |
+| `forward_request_meta` | Backend speaks MCP 2026-07-28: forward clients' `_meta`, `requestState`, `inputResponses` on `tools/call` |
+
+### Backends behind SSO or a VPN
+
+The hub does not run logins itself. Put the login next to the backend with
+[mcp-cli](https://github.com/hyhilman/mcp-cli): a small MCP server that
+exposes fixed health / login / status commands (NetBird, `aws sso login`, ...)
+from a TOML file. Add it as a stdio backend:
+
+```toml
+[backends.netbird]
+transport = "stdio"
+command = "mcp-cli"
+args = ["serve", "-c", "/etc/mcp-cli/netbird.toml"]
+namespace = "netbird"
+forward_request_meta = true      # login prompts reach modern clients
+
+[backends.internal-db]
+transport = "http"
+url = "https://db-mcp.internal/mcp"
+unavailable_hint = "Needs the VPN: call netbird.netbird_login, show the link, then retry."
+```
+
+When a backend was unreachable (e.g. the VPN was down at startup), a call to
+one of its `<namespace>.*` tools reconnects it first; subscribers then get
+`notifications/tools/list_changed`.
+
+### Protocol
+
+- Clients: MCP `2025-06-18` (`initialize`) and `2026-07-28` (`server/discover`,
+  per-request `_meta`, `resultType`, `MCP-Protocol-Version` header check,
+  `subscriptions/listen` for tool-list changes over SSE / stdio).
+- Backend `tools/call` results (`content`, `isError`, `input_required`) are
+  passed through unchanged.
+- `resources/list` / `resources/read` and MCP Events (`events/list`,
+  `events/subscribe`, `events/unsubscribe`) are forwarded to backends that
+  advertise them. Event names get the namespace prefix
+  (`netbird.cli.state_changed`); webhooks go from the backend to the
+  subscriber directly.
 
 ### OAuth2 options
 

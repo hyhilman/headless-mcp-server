@@ -12,7 +12,8 @@ pub mod types;
 pub use error::{BackendError, BackendErrorKind, BackendResult};
 pub use types::{
     BackendDef, BackendTransport, CallToolResult, ConnectionMode, ContentBlock, InitializeResult,
-    OAuth2Config, ServerCapabilities, ServerInfo, StderrMode, ToolDescriptor,
+    OAuth2Config, PromptsCapability, ResourcesCapability, ServerCapabilities, ServerInfo,
+    StderrMode, ToolDescriptor, ToolsCapability,
 };
 
 use async_trait::async_trait;
@@ -57,6 +58,20 @@ pub trait McpBackend: Send + Sync {
 
     /// Health check — is the downstream reachable and responding?
     async fn health_check(&self) -> BackendResult<()>;
+
+    /// Any other JSON-RPC request (`resources/read`, `events/subscribe`, a
+    /// `tools/call` with extra params, ...). Backend must be connected.
+    async fn request(
+        &self,
+        method: &str,
+        _params: Option<Value>,
+        _timeout: Duration,
+    ) -> BackendResult<Value> {
+        Err(BackendError::new(
+            BackendErrorKind::Internal,
+            format!("backend '{}' does not support '{method}'", self.backend_id()),
+        ))
+    }
 
     /// The MCP protocol version this backend speaks, learned during connect().
     fn protocol_version(&self) -> Option<&str> {
