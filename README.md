@@ -20,6 +20,9 @@ backends once in the hub. Every agent points to the hub. Done.
 ### Install
 
 ```bash
+# Prebuilt binary (Linux x86_64/arm64 static, macOS): see GitHub Releases
+curl -fsSL https://github.com/hyhilman/headless-mcp-server/releases/latest/download/headless-mcp-x86_64-unknown-linux-musl.tar.gz | tar xz
+
 # From source
 git clone https://github.com/hyhilman/headless-mcp-server
 cd headless-mcp-server
@@ -272,8 +275,12 @@ docker run -d \
   ghcr.io/hyhilman/headless-mcp-server:latest
 ```
 
-The image is published to `ghcr.io/hyhilman/headless-mcp-server` on every
-version bump in `Cargo.toml`. See `.github/workflows/release.yml`.
+Every version bump in `Cargo.toml` on `master` tags `v<version>`, builds the
+binaries once (Linux musl x86_64/arm64, macOS arm64/x86_64), attaches them to a
+GitHub release, and pushes a multi-arch image (`<version>`, `<major>.<minor>`,
+`latest`) to `ghcr.io/hyhilman/headless-mcp-server` from the same Linux
+binaries. See `.github/workflows/release.yml` and `publish.yml`. To publish an
+existing tag, run the Publish workflow by hand.
 
 ## Architecture
 
