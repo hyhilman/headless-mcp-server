@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use headless_mcp_core::BackendErrorKind;
 use headless_mcp_registry::BackendRegistry;
 use headless_mcp_wire::{
     JsonRpcError, JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
@@ -278,8 +279,14 @@ impl McpSession {
             }
             Err(err) => {
                 let mut message = err.to_string();
+                // Only an unreachable backend gets the hint; an answer (even a 4xx) means it is up.
+                let unreachable = matches!(
+                    err.kind,
+                    BackendErrorKind::Connection | BackendErrorKind::Timeout
+                );
                 let hint = backend
                     .as_deref()
+                    .filter(|_| unreachable)
                     .and_then(|id| self.registry.unavailable_hint(id));
                 if let Some(hint) = hint {
                     message.push('\n');
@@ -486,8 +493,9 @@ mod tests {
     use async_trait::async_trait;
     use crate::audit::TracingAuditLogger;
     use headless_mcp_core::{
-        BackendDef, BackendResult, BackendTransport, ConnectionMode, InitializeResult, McpBackend,
-        ResourcesCapability, ServerCapabilities, ServerInfo, StderrMode, ToolDescriptor,
+        BackendDef, BackendError, BackendResult, BackendTransport, ConnectionMode,
+        InitializeResult, McpBackend, ResourcesCapability, ServerCapabilities, ServerInfo,
+        StderrMode, ToolDescriptor,
     };
     use headless_mcp_wire::{JsonRpcId, JsonRpcNotification as WireNotification};
 
@@ -738,6 +746,47 @@ mod tests {
         // Legacy clients never get `input_required`.
         let legacy = ok(&session, request(4, "tools/call", Some(serde_json::json!({ "name": "vpn.peers" })))).await;
         assert_eq!(legacy["content"][0]["text"], "LOGIN_REQUIRED");
+    }
+
+    /// Serves one tool whose call always fails with `kind`.
+    struct FailingBackend(BackendErrorKind);
+
+    #[async_trait]
+    impl McpBackend for FailingBackend {
+        fn backend_id(&self) -> &str { "down" }
+        fn label(&self) -> &str { "down" }
+        async fn connect(&self) -> BackendResult<InitializeResult> { FakeBackend.connect().await }
+        async fn list_tools(&self) -> BackendResult<Vec<ToolDescriptor>> { FakeBackend.list_tools().await }
+        async fn call_tool(&self, _: &str, _: Option<Value>, _: Duration) -> BackendResult<Value> {
+            Err(BackendError::new(self.0, "boom"))
+        }
+        async fn disconnect(&self) -> BackendResult<()> { Ok(()) }
+        async fn health_check(&self) -> BackendResult<()> { Ok(()) }
+    }
+
+    async fn call_failing(kind: BackendErrorKind) -> String {
+        let registry = Arc::new(BackendRegistry::new());
+        let def: BackendDef = serde_json::from_value(serde_json::json!({
+            "id": "down", "transport": "stdio", "command": "unused", "namespace": "vpn",
+            "unavailable_hint": "Needs the VPN",
+        }))
+        .unwrap();
+        registry.register(def, Arc::new(FailingBackend(kind))).await.unwrap();
+        registry.connect_all().await;
+        let session = McpSession::new(registry, Arc::new(TracingAuditLogger));
+        ok(&session, request(1, "initialize", None)).await;
+        let r = ok(&session, request(2, "tools/call", Some(serde_json::json!({ "name": "vpn.peers" })))).await;
+        r["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn unavailable_hint_is_only_for_an_unreachable_backend() {
+        for kind in [BackendErrorKind::Connection, BackendErrorKind::Timeout] {
+            assert!(call_failing(kind).await.ends_with("Needs the VPN"), "{kind:?}");
+        }
+        for kind in [BackendErrorKind::Protocol, BackendErrorKind::Auth, BackendErrorKind::Internal] {
+            assert_eq!(call_failing(kind).await, "boom", "{kind:?}");
+        }
     }
 
     #[tokio::test]

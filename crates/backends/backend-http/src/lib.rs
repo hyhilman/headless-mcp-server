@@ -13,6 +13,7 @@ mod oauth2;
 pub mod token_store;
 
 use async_trait::async_trait;
+use base64::Engine;
 use headless_mcp_core::{
     BackendDef, BackendError, BackendErrorKind, BackendResult, BackendTransport, InitializeResult,
     McpBackend, ToolDescriptor,
@@ -22,14 +23,19 @@ use headless_mcp_wire::{
     decode_message, JsonRpcId, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, SseDecoder,
 };
 use oauth2::{OAuth2TokenManager, parse_resource_metadata_url};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const APPLICATION_JSON: &str = "application/json";
 const SSE_CONTENT_TYPE: &str = "text/event-stream";
+const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// Where a tool argument lives in the call and the `Mcp-Param-*` header it is mirrored into.
+type ParamHeaders = Vec<(Vec<String>, String)>;
 
 /// An HTTP-connected MCP backend with optional OAuth2 support.
 pub struct HttpBackend {
@@ -47,6 +53,8 @@ pub struct HttpBackend {
     daemon_mode: bool,
     /// Mcp-Session-Id from initialize response (required by some servers like Atlassian).
     session_id: Mutex<Option<String>>,
+    /// `x-mcp-header` annotations per downstream tool, from `tools/list`.
+    param_headers: Mutex<HashMap<String, ParamHeaders>>,
 }
 
 impl HttpBackend {
@@ -85,6 +93,7 @@ impl HttpBackend {
             default_timeout,
             daemon_mode,
             session_id: Mutex::new(None),
+            param_headers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -160,13 +169,18 @@ impl HttpBackend {
         );
     }
 
-    async fn post_json(&self, body: &[u8]) -> Result<(Vec<u8>, reqwest::StatusCode, reqwest::header::HeaderMap), BackendError> {
+    async fn post_json(
+        &self,
+        body: &[u8],
+        extra_headers: &HeaderMap,
+    ) -> Result<(Vec<u8>, reqwest::StatusCode, HeaderMap), BackendError> {
         let client = { self.client.lock().unwrap().clone() };
 
         let mut req = client
             .post(&self.url)
             .header(CONTENT_TYPE, APPLICATION_JSON)
-            .header(ACCEPT, format!("{APPLICATION_JSON}, {SSE_CONTENT_TYPE}"));
+            .header(ACCEPT, format!("{APPLICATION_JSON}, {SSE_CONTENT_TYPE}"))
+            .headers(extra_headers.clone());
 
         if let Some(ref sid) = *self.session_id.lock().unwrap() {
             req = req.header("Mcp-Session-Id", sid);
@@ -177,10 +191,12 @@ impl HttpBackend {
             .send()
             .await
             .map_err(|e| {
-                BackendError::new(
-                    BackendErrorKind::Connection,
-                    format!("HTTP request to '{}' failed: {e}", self.def.id),
-                )
+                let kind = if e.is_timeout() {
+                    BackendErrorKind::Timeout
+                } else {
+                    BackendErrorKind::Connection
+                };
+                BackendError::new(kind, format!("HTTP request to '{}' failed: {e}", self.def.id))
             })?;
 
         let status = response.status();
@@ -231,6 +247,7 @@ impl HttpBackend {
         retry: bool,
     ) -> Result<Value, BackendError> {
         let id = self.request_counter.fetch_add(1, Ordering::SeqCst) as i64;
+        let extra_headers = self.modern_headers(method, params.as_ref());
         let request =
             JsonRpcMessage::Request(JsonRpcRequest::new(JsonRpcId::Number(id), method, params));
 
@@ -238,7 +255,7 @@ impl HttpBackend {
             BackendError::new(BackendErrorKind::Protocol, format!("serialize: {e}"))
         })?;
 
-        let (response_bytes, status, headers) = self.post_json(&body).await?;
+        let (response_bytes, status, headers) = self.post_json(&body, &extra_headers).await?;
 
         // Capture session ID from response (Atlassian MCP sends Mcp-Session-Id)
         if let Some(sid) = headers.get("mcp-session-id") {
@@ -279,7 +296,7 @@ impl HttpBackend {
                         self.persist_token(&token, refresh.as_deref(), expires_in).await;
 
                         // Retry
-                        let (retry_bytes, retry_status, retry_headers) = self.post_json(&body).await?;
+                        let (retry_bytes, retry_status, retry_headers) = self.post_json(&body, &extra_headers).await?;
                         if let Some(sid) = retry_headers.get("mcp-session-id") {
                             if let Ok(val) = sid.to_str() {
                                 *self.session_id.lock().unwrap() = Some(val.to_string());
@@ -303,13 +320,67 @@ impl HttpBackend {
 
         if !status.is_success() {
             let body_str = String::from_utf8_lossy(&response_bytes);
+            // A 5xx means the backend (or the proxy in front of it) is down; a 4xx came from a live server.
+            let kind = if status.is_server_error() {
+                BackendErrorKind::Connection
+            } else {
+                BackendErrorKind::Protocol
+            };
             return Err(BackendError::new(
-                BackendErrorKind::Protocol,
+                kind,
                 format!("HTTP {} from '{}': {}", status.as_u16(), self.def.id, body_str),
             ));
         }
 
         Self::parse_response(&response_bytes, &self.def.id)
+    }
+
+    /// Headers a 2026-07-28 request must carry; empty for legacy requests.
+    ///
+    /// Built from the body so they cannot disagree with it.
+    fn modern_headers(&self, method: &str, params: Option<&Value>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let Some(params) = params else { return headers };
+        let Some(version) = params
+            .get("_meta")
+            .and_then(|m| m.get(META_PROTOCOL_VERSION))
+            .and_then(Value::as_str)
+        else {
+            return headers;
+        };
+        let mut put = |name: HeaderName, value: &str| {
+            if let Ok(value) = HeaderValue::from_str(value) {
+                headers.insert(name, value);
+            }
+        };
+        put(HeaderName::from_static("mcp-protocol-version"), version);
+        put(HeaderName::from_static("mcp-method"), method);
+
+        let name_field = match method {
+            "tools/call" | "prompts/get" => Some("name"),
+            "resources/read" => Some("uri"),
+            _ => None,
+        };
+        let source = name_field.and_then(|f| params.get(f)).and_then(Value::as_str);
+        if let Some(source) = source {
+            put(HeaderName::from_static("mcp-name"), &encode_header_value(source));
+        }
+
+        if method == "tools/call" {
+            let tool_headers = self.param_headers.lock().unwrap();
+            let annotated = source.and_then(|tool| tool_headers.get(tool));
+            for (path, suffix) in annotated.into_iter().flatten() {
+                let value = params
+                    .get("arguments")
+                    .and_then(|args| path.iter().try_fold(args, |v, key| v.get(key.as_str())))
+                    .and_then(header_text);
+                let name = HeaderName::from_bytes(format!("Mcp-Param-{suffix}").as_bytes());
+                if let (Some(value), Ok(name)) = (value, name) {
+                    put(name, &encode_header_value(&value));
+                }
+            }
+        }
+        headers
     }
 
     fn parse_response(response_bytes: &[u8], backend_id: &str) -> Result<Value, BackendError> {
@@ -446,9 +517,15 @@ impl McpBackend for HttpBackend {
         let tools_list = result.get("tools").and_then(|v| v.as_array()).ok_or_else(|| {
             BackendError::new(BackendErrorKind::Protocol, "no 'tools' array in response")
         })?;
-        tools_list.iter().map(|t| serde_json::from_value(t.clone()).map_err(|e| {
+        let tools: Vec<ToolDescriptor> = tools_list.iter().map(|t| serde_json::from_value(t.clone()).map_err(|e| {
             BackendError::new(BackendErrorKind::Protocol, format!("invalid tool descriptor: {e}"))
-        })).collect()
+        })).collect::<Result<_, _>>()?;
+        *self.param_headers.lock().unwrap() = tools
+            .iter()
+            .map(|t| (t.name.clone(), param_header_paths(&t.input_schema)))
+            .filter(|(_, paths)| !paths.is_empty())
+            .collect();
+        Ok(tools)
     }
 
     async fn call_tool(&self, name: &str, arguments: Option<Value>, _timeout: Duration) -> BackendResult<Value> {
@@ -479,6 +556,51 @@ impl McpBackend for HttpBackend {
     }
 
     fn protocol_version(&self) -> Option<&str> { None }
+}
+
+/// `x-mcp-header` annotations reachable through `properties` keys only.
+fn param_header_paths(schema: &Value) -> ParamHeaders {
+    fn walk(schema: &Value, path: &mut Vec<String>, out: &mut ParamHeaders) {
+        let Some(props) = schema.get("properties").and_then(Value::as_object) else { return };
+        for (key, prop) in props {
+            path.push(key.clone());
+            let primitive = matches!(
+                prop.get("type").and_then(Value::as_str),
+                Some("string" | "integer" | "boolean")
+            );
+            if let (Some(name), true) = (prop.get("x-mcp-header").and_then(Value::as_str), primitive) {
+                out.push((path.clone(), name.to_string()));
+            }
+            walk(prop, path, out);
+            path.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(schema, &mut Vec::new(), &mut out);
+    out
+}
+
+/// A string, integer or boolean argument as header text; `None` for null and other types.
+fn header_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) if n.is_i64() || n.is_u64() => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Plain ASCII as is; anything else, or anything that looks like the sentinel, as `=?base64?...?=`.
+fn encode_header_value(value: &str) -> String {
+    let plain = value.chars().all(|c| (' '..='~').contains(&c))
+        && !value.starts_with(' ')
+        && !value.ends_with(' ')
+        && !(value.starts_with("=?base64?") && value.ends_with("?="));
+    if plain {
+        value.to_string()
+    } else {
+        format!("=?base64?{}?=", base64::engine::general_purpose::STANDARD.encode(value))
+    }
 }
 
 #[cfg(test)]
@@ -520,6 +642,173 @@ mod tests {
         );
         stream.write_all(resp.as_bytes()).await.unwrap();
         stream.shutdown().await.ok();
+    }
+
+    /// Serves `replies` (status, body) in order, repeating the last; returns the URL and the raw
+    /// request head (lower-cased) of every POST it saw.
+    async fn spawn_recording_backend(
+        replies: Vec<(u16, String)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut n = 0;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut reader = BufReader::new(&mut stream);
+                let mut head = String::new();
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                    head.push_str(&line.to_ascii_lowercase());
+                }
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).await.unwrap();
+                log.lock().unwrap().push(head);
+                let (status, reply) = &replies[n.min(replies.len() - 1)];
+                n += 1;
+                write_response(&mut stream, *status, "Reply", reply).await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn ok_reply(result: Value) -> (u16, String) {
+        (200, serde_json::json!({ "jsonrpc": "2.0", "id": 0, "result": result }).to_string())
+    }
+
+    fn connected_backend(url: String) -> HttpBackend {
+        let def: BackendDef = serde_json::from_value(serde_json::json!({
+            "id": "mock", "transport": "http", "url": url,
+        }))
+        .unwrap();
+        let backend = HttpBackend::new(def);
+        backend.connected.store(true, Ordering::SeqCst);
+        backend
+    }
+
+    fn modern_call(name: &str, arguments: Value) -> Value {
+        serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+            "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" },
+        })
+    }
+
+    #[tokio::test]
+    async fn a_modern_tools_call_carries_the_matching_request_headers() {
+        let (url, seen) = spawn_recording_backend(vec![ok_reply(serde_json::json!({}))]).await;
+        let backend = connected_backend(url);
+        let params = modern_call("peers", serde_json::json!({}));
+        backend.request("tools/call", Some(params), Duration::from_secs(5)).await.unwrap();
+
+        let head = seen.lock().unwrap()[0].clone();
+        assert!(head.contains("mcp-protocol-version: 2026-07-28\r\n"), "{head}");
+        assert!(head.contains("mcp-method: tools/call\r\n"), "{head}");
+        assert!(head.contains("mcp-name: peers\r\n"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn a_modern_resources_read_names_the_uri() {
+        let (url, seen) = spawn_recording_backend(vec![ok_reply(serde_json::json!({}))]).await;
+        let backend = connected_backend(url);
+        let params = serde_json::json!({
+            "uri": "cli://netbird/state",
+            "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" },
+        });
+        backend.request("resources/read", Some(params), Duration::from_secs(5)).await.unwrap();
+
+        let head = seen.lock().unwrap()[0].clone();
+        assert!(head.contains("mcp-method: resources/read\r\n"), "{head}");
+        assert!(head.contains("mcp-name: cli://netbird/state\r\n"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn legacy_requests_keep_their_headers() {
+        let (url, seen) = spawn_recording_backend(vec![ok_reply(serde_json::json!({}))]).await;
+        let backend = connected_backend(url);
+        let params = serde_json::json!({ "name": "peers", "arguments": {} });
+        backend.request("tools/call", Some(params), Duration::from_secs(5)).await.unwrap();
+        backend.request("tools/list", None, Duration::from_secs(5)).await.unwrap();
+
+        for head in seen.lock().unwrap().iter() {
+            assert!(!head.contains("mcp-protocol-version"), "{head}");
+            assert!(!head.contains("mcp-method"), "{head}");
+            assert!(!head.contains("mcp-name"), "{head}");
+            assert!(head.contains("accept: application/json, text/event-stream"), "{head}");
+        }
+    }
+
+    #[tokio::test]
+    async fn annotated_arguments_are_mirrored_into_param_headers() {
+        let tools = ok_reply(serde_json::json!({ "tools": [{
+            "name": "execute_sql",
+            "description": "sql",
+            "inputSchema": { "type": "object", "properties": {
+                "region": { "type": "string", "x-mcp-header": "Region" },
+                "greeting": { "type": "string", "x-mcp-header": "Greeting" },
+                "limit": { "type": "integer", "x-mcp-header": "Limit" },
+                "skipped": { "type": "string", "x-mcp-header": "Skipped" },
+                "query": { "type": "string" },
+            } },
+        }] }));
+        let (url, seen) = spawn_recording_backend(vec![tools, ok_reply(serde_json::json!({}))]).await;
+        let backend = connected_backend(url);
+        backend.list_tools().await.unwrap();
+        let args = serde_json::json!({
+            "region": "us-west1", "greeting": "Hello, 世界", "limit": 7,
+            "skipped": null, "query": "SELECT 1",
+        });
+        backend
+            .request("tools/call", Some(modern_call("execute_sql", args)), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let head = seen.lock().unwrap()[1].clone();
+        assert!(head.contains("mcp-param-region: us-west1\r\n"), "{head}");
+        // The mock lower-cases the whole head.
+        assert!(head.contains("mcp-param-greeting: =?base64?sgvsbg8sios4luevja==?=\r\n"), "{head}");
+        assert!(head.contains("mcp-param-limit: 7\r\n"), "{head}");
+        assert!(!head.contains("mcp-param-skipped"), "{head}");
+        assert!(!head.contains("mcp-param-query"), "{head}");
+    }
+
+    #[test]
+    fn header_values_that_are_not_plain_ascii_are_base64_encoded() {
+        assert_eq!(encode_header_value("us-west1"), "us-west1");
+        assert_eq!(encode_header_value(" padded "), "=?base64?IHBhZGRlZCA=?=");
+        assert_eq!(encode_header_value("line1\nline2"), "=?base64?bGluZTEKbGluZTI=?=");
+        assert_eq!(encode_header_value("=?base64?literal?="), "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=");
+    }
+
+    #[tokio::test]
+    async fn a_4xx_is_a_protocol_error_but_a_5xx_or_refused_connection_is_unreachable() {
+        let mismatch = (
+            400,
+            serde_json::json!({ "code": -32020, "message": "Header mismatch" }).to_string(),
+        );
+        let (url, _) = spawn_recording_backend(vec![mismatch]).await;
+        let e = connected_backend(url).request("tools/list", None, Duration::from_secs(5)).await.unwrap_err();
+        assert_eq!(e.kind, BackendErrorKind::Protocol, "{e}");
+
+        let (url, _) = spawn_recording_backend(vec![(503, "{}".into())]).await;
+        let e = connected_backend(url).request("tools/list", None, Duration::from_secs(5)).await.unwrap_err();
+        assert_eq!(e.kind, BackendErrorKind::Connection, "{e}");
+
+        let closed = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let e = connected_backend(closed).request("tools/list", None, Duration::from_secs(5)).await.unwrap_err();
+        assert_eq!(e.kind, BackendErrorKind::Connection, "{e}");
     }
 
     /// A downstream MCP backend that 401s the first `tools/call` POST — simulating an
