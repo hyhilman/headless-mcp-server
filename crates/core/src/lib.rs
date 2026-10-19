@@ -77,4 +77,10 @@ pub trait McpBackend: Send + Sync {
     fn protocol_version(&self) -> Option<&str> {
         None
     }
+
+    /// True once, after the backend re-did its handshake on its own (e.g. the server restarted),
+    /// so the caller should list its tools again.
+    fn take_tools_refresh(&self) -> bool {
+        false
+    }
 }

@@ -249,6 +249,14 @@ When a backend was unreachable (e.g. the VPN was down at startup), a call to
 one of its `<namespace>.*` tools reconnects it first; subscribers then get
 `notifications/tools/list_changed`.
 
+When an HTTP backend restarts while the hub keeps running, it forgets the hub's
+session. A call then fails with HTTP 404 (for a request that carried an
+`Mcp-Session-Id`) or with a `-32600` error saying the session "is not
+initialized". The hub runs the `initialize` handshake again and retries the
+call once. Many calls failing together share one handshake. Calls made with
+`2026-07-28` are sessionless and are not retried. The hub then re-lists the
+backend's tools on its next health check.
+
 ### Protocol
 
 - Clients: MCP `2025-06-18` (`initialize`) and `2026-07-28` (`server/discover`,
