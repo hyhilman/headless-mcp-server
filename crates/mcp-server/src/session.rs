@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::audit::{AuditEvent, AuditLogger, AuditOutcome};
 use crate::protocol::{
-    mark_complete, RequestCtx, LEGACY_PROTOCOL_VERSION, META_SERVER_INFO,
+    mark_cacheable, mark_complete, RequestCtx, LEGACY_PROTOCOL_VERSION, META_SERVER_INFO,
     MODERN_PROTOCOL_VERSIONS,
 };
 
@@ -136,6 +136,7 @@ impl McpSession {
         if ctx.is_modern() {
             if let Ok(value) = &mut result {
                 mark_complete(value);
+                mark_cacheable(&request.method, value);
             }
         }
         (result, tool_name, outcome)
@@ -554,6 +555,64 @@ mod tests {
         let e = err(&session, request(3, "tools/list", Some(params))).await;
         assert_eq!(e.code, crate::protocol::UNSUPPORTED_PROTOCOL_VERSION);
         assert_eq!(e.data.unwrap()["supported"], serde_json::json!(["2026-07-28"]));
+    }
+
+    /// `resultType`, `ttlMs` and `cacheScope` as 2026-07-28 requires them.
+    fn assert_cacheable(r: &Value, ttl_ms: u64) {
+        assert_eq!(r["resultType"], "complete", "{r}");
+        assert_eq!(r["ttlMs"].as_u64(), Some(ttl_ms), "{r}");
+        assert_eq!(r["cacheScope"], "private", "{r}");
+    }
+
+    #[tokio::test]
+    async fn modern_tools_list_carries_cache_hints() {
+        let session = empty_session();
+        let params = modern(serde_json::json!({}));
+        let r = ok(&session, request(1, "tools/list", Some(params))).await;
+        assert_cacheable(&r, 60_000);
+        assert!(r["tools"].as_array().unwrap().is_empty());
+
+        let r = ok(
+            &session,
+            request(2, "server/discover", Some(modern(serde_json::json!({})))),
+        )
+        .await;
+        assert_cacheable(&r, 60_000);
+    }
+
+    #[tokio::test]
+    async fn legacy_tools_list_is_unchanged() {
+        let session = empty_session();
+        let r = ok(&session, request(1, "initialize", None)).await;
+        assert!(r.get("resultType").is_none() && r.get("ttlMs").is_none());
+        let r = ok(&session, request(2, "tools/list", None)).await;
+        assert_eq!(r, serde_json::json!({ "tools": [] }));
+    }
+
+    #[tokio::test]
+    async fn modern_resources_carry_cache_hints() {
+        let session = forwarding_session(false).await;
+        let params = modern(serde_json::json!({}));
+        let r = ok(&session, request(2, "resources/list", Some(params))).await;
+        assert_cacheable(&r, 60_000);
+        assert_eq!(r["resources"][0]["uri"], "cli://netbird/state");
+
+        let params = modern(serde_json::json!({ "uri": "cli://netbird/state" }));
+        let r = ok(&session, request(3, "resources/read", Some(params))).await;
+        assert_cacheable(&r, 0);
+        assert_eq!(r["contents"][0]["text"], "ready");
+    }
+
+    #[tokio::test]
+    async fn legacy_resources_are_unchanged() {
+        let session = forwarding_session(false).await;
+        let r = ok(&session, request(2, "resources/list", None)).await;
+        let resource = serde_json::json!({ "uri": "cli://netbird/state", "name": "netbird" });
+        assert_eq!(r, serde_json::json!({ "resources": [resource] }));
+        let params = serde_json::json!({ "uri": "cli://netbird/state" });
+        let r = ok(&session, request(3, "resources/read", Some(params))).await;
+        let content = serde_json::json!({ "uri": "cli://netbird/state", "text": "ready" });
+        assert_eq!(r, serde_json::json!({ "contents": [content] }));
     }
 
     #[tokio::test]

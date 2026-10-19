@@ -254,6 +254,8 @@ one of its `<namespace>.*` tools reconnects it first; subscribers then get
 - Clients: MCP `2025-06-18` (`initialize`) and `2026-07-28` (`server/discover`,
   per-request `_meta`, `resultType`, `MCP-Protocol-Version` header check,
   `subscriptions/listen` for tool-list changes over SSE / stdio).
+  Modern list, discover and read results carry `ttlMs` and `cacheScope`
+  (`private`; 60 s for lists, 0 for `resources/read`).
 - Backend `tools/call` results (`content`, `isError`, `input_required`) are
   passed through unchanged.
 - `resources/list` / `resources/read` and MCP Events (`events/list`,
