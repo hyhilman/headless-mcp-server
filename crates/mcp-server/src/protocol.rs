@@ -75,3 +75,69 @@ pub(crate) fn mark_complete(value: &mut Value) {
             .or_insert_with(|| Value::String("complete".into()));
     }
 }
+
+/// Freshness hint for list and discover results; backends can reconnect, and
+/// `list_changed` already invalidates the cache sooner.
+const LIST_TTL_MS: u64 = 60_000;
+
+/// `ttlMs` and `cacheScope` the 2026-07-28 revision requires on these results.
+fn cache_ttl_ms(method: &str) -> Option<u64> {
+    match method {
+        "server/discover"
+        | "tools/list"
+        | "resources/list"
+        | "resources/templates/list"
+        | "prompts/list" => Some(LIST_TTL_MS),
+        // Resource contents are live state, so they are always stale.
+        "resources/read" => Some(0),
+        _ => None,
+    }
+}
+
+/// Add `ttlMs` and `cacheScope` to a modern result of a cacheable method.
+pub(crate) fn mark_cacheable(method: &str, value: &mut Value) {
+    let Some(ttl_ms) = cache_ttl_ms(method) else {
+        return;
+    };
+    let Value::Object(obj) = value else {
+        return;
+    };
+    // Interim `input_required` results carry no caching hints.
+    if obj.get("resultType").and_then(Value::as_str) != Some("complete") {
+        return;
+    }
+    if !obj.get("ttlMs").is_some_and(Value::is_u64) {
+        obj.insert("ttlMs".into(), Value::from(ttl_ms));
+    }
+    // Each expose port has its own token and tool set, so a shared cache could leak it.
+    obj.insert("cacheScope".into(), Value::String("private".into()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_hints_skip_input_required_and_other_methods() {
+        let mut interim = serde_json::json!({ "resultType": "input_required" });
+        mark_cacheable("resources/read", &mut interim);
+        assert_eq!(
+            interim,
+            serde_json::json!({ "resultType": "input_required" })
+        );
+
+        let mut call = serde_json::json!({ "resultType": "complete", "content": [] });
+        mark_cacheable("tools/call", &mut call);
+        assert!(call.get("ttlMs").is_none() && call.get("cacheScope").is_none());
+    }
+
+    #[test]
+    fn backend_cache_scope_never_widens() {
+        let mut read = serde_json::json!({
+            "resultType": "complete", "ttlMs": 5000, "cacheScope": "public", "contents": []
+        });
+        mark_cacheable("resources/read", &mut read);
+        assert_eq!(read["ttlMs"], 5000);
+        assert_eq!(read["cacheScope"], "private");
+    }
+}
