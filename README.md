@@ -221,8 +221,8 @@ headless-mcp auth atlassian
 | `tools_allow` / `tools_deny` | Expose only / hide these tools (downstream names) |
 | `pin_args` | Arguments the hub always sets, e.g. `{ profile = "prod" }`; hidden from schemas, caller values ignored |
 | `deny_args` | Arguments callers may not set; hidden from schemas, calls using them are rejected |
-| `unavailable_hint` | Appended to errors when the backend is unreachable, e.g. `"Needs the VPN: call netbird.netbird_login"` |
-| `forward_request_meta` | Backend speaks MCP 2026-07-28: forward clients' `_meta`, `requestState`, `inputResponses` on `tools/call` |
+| `unavailable_hint` | Appended to errors when the backend is unreachable (connect error, timeout, HTTP 5xx), not when it answers with a 4xx, e.g. `"Needs the VPN: call netbird.netbird_login"` |
+| `forward_request_meta` | Backend speaks MCP 2026-07-28: forward clients' `_meta`, `requestState`, `inputResponses` on `tools/call`; HTTP backends get the matching `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` and `Mcp-Param-*` headers |
 
 ### Backends behind SSO or a VPN
 
