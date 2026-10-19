@@ -295,7 +295,16 @@ impl BackendRegistry {
             if let Some(backend) = backend {
                 match backend.health_check().await {
                     Ok(()) => {
-                        // Still healthy
+                        if backend.take_tools_refresh() {
+                            match self.connect_backend(&id).await {
+                                Ok(()) => {
+                                    tracing::info!(%id, "tools refreshed after backend re-initialized")
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%id, %e, "tool refresh after re-initialize failed")
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(%id, %e, "health check failed; marking unhealthy");
@@ -710,6 +719,62 @@ mod tests {
             pin_args: serde_json::Map::new(),
             deny_args: vec![],
         }
+    }
+
+    /// A backend whose tool set changes behind the registry's back, then reports it.
+    struct ReinitBackend {
+        tools: std::sync::Mutex<Vec<ToolDescriptor>>,
+        refresh: AtomicBool,
+    }
+
+    #[async_trait]
+    impl McpBackend for ReinitBackend {
+        fn backend_id(&self) -> &str {
+            "re"
+        }
+        fn label(&self) -> &str {
+            "re"
+        }
+        async fn connect(&self) -> BackendResult<InitializeResult> {
+            MockBackend::new("re", vec![]).connect().await
+        }
+        async fn list_tools(&self) -> BackendResult<Vec<ToolDescriptor>> {
+            Ok(self.tools.lock().unwrap().clone())
+        }
+        async fn call_tool(&self, _: &str, _: Option<Value>, _: Duration) -> BackendResult<Value> {
+            Ok(Value::Null)
+        }
+        async fn disconnect(&self) -> BackendResult<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> BackendResult<()> {
+            Ok(())
+        }
+        fn take_tools_refresh(&self) -> bool {
+            self.refresh.swap(false, Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_health_check_relists_tools_after_the_backend_re_initialized() {
+        let registry = BackendRegistry::new();
+        let backend = Arc::new(ReinitBackend {
+            tools: std::sync::Mutex::new(vec![make_tool("old")]),
+            refresh: AtomicBool::new(false),
+        });
+        registry
+            .register(make_def("re", None), backend.clone())
+            .await
+            .unwrap();
+        registry.connect_backend("re").await.unwrap();
+
+        *backend.tools.lock().unwrap() = vec![make_tool("new")];
+        registry.run_health_checks().await;
+        assert_eq!(registry.aggregated_tools()[0].name, "old");
+
+        backend.refresh.store(true, Ordering::SeqCst);
+        registry.run_health_checks().await;
+        assert_eq!(registry.aggregated_tools()[0].name, "new");
     }
 
     #[tokio::test]

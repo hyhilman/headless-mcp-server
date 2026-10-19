@@ -55,6 +55,27 @@ pub struct HttpBackend {
     session_id: Mutex<Option<String>>,
     /// `x-mcp-header` annotations per downstream tool, from `tools/list`.
     param_headers: Mutex<HashMap<String, ParamHeaders>>,
+    /// Serialises re-initialisation so one lost session costs one handshake, not one per caller.
+    reinit_lock: tokio::sync::Mutex<()>,
+    /// Bumped after every re-initialisation attempt; lets waiters see that someone else already ran one.
+    session_epoch: AtomicU64,
+    /// Set by a successful re-initialisation; the registry re-lists tools when it takes this.
+    tools_refresh: AtomicBool,
+}
+
+/// A failed request, and why the backend's session is thought lost (if it is).
+struct Failure {
+    error: BackendError,
+    session_lost: Option<&'static str>,
+}
+
+impl From<BackendError> for Failure {
+    fn from(error: BackendError) -> Self {
+        Self {
+            error,
+            session_lost: None,
+        }
+    }
 }
 
 impl HttpBackend {
@@ -94,6 +115,9 @@ impl HttpBackend {
             daemon_mode,
             session_id: Mutex::new(None),
             param_headers: Mutex::new(HashMap::new()),
+            reinit_lock: tokio::sync::Mutex::new(()),
+            session_epoch: AtomicU64::new(0),
+            tools_refresh: AtomicBool::new(false),
         }
     }
 
@@ -173,6 +197,7 @@ impl HttpBackend {
         &self,
         body: &[u8],
         extra_headers: &HeaderMap,
+        session_id: Option<&str>,
     ) -> Result<(Vec<u8>, reqwest::StatusCode, HeaderMap), BackendError> {
         let client = { self.client.lock().unwrap().clone() };
 
@@ -182,7 +207,7 @@ impl HttpBackend {
             .header(ACCEPT, format!("{APPLICATION_JSON}, {SSE_CONTENT_TYPE}"))
             .headers(extra_headers.clone());
 
-        if let Some(ref sid) = *self.session_id.lock().unwrap() {
+        if let Some(sid) = session_id {
             req = req.header("Mcp-Session-Id", sid);
         }
 
@@ -240,12 +265,95 @@ impl HttpBackend {
         Ok((response_bytes.to_vec(), status, headers))
     }
 
+    /// Sends a request; if a legacy request finds the backend's session gone (it restarted),
+    /// runs the handshake again and sends the request once more.
     async fn send_request(
         &self,
         method: &str,
         params: Option<Value>,
         retry: bool,
     ) -> Result<Value, BackendError> {
+        let epoch = self.session_epoch.load(Ordering::SeqCst);
+        let first = self.send_request_inner(method, params.clone(), retry).await;
+        let Err(Failure {
+            error,
+            session_lost: Some(reason),
+        }) = first
+        else {
+            return first.map_err(|f| f.error);
+        };
+        // Modern calls are sessionless, and `initialize` is the handshake itself.
+        if method == "initialize" || modern_version(params.as_ref()).is_some() {
+            return Err(error);
+        }
+        if let Err(e) = self.reinitialize(epoch, reason).await {
+            tracing::warn!(backend_id = %self.def.id, %e, "re-initialize failed");
+            return Err(error);
+        }
+        self.send_request_inner(method, params, retry)
+            .await
+            .map_err(|f| f.error)
+    }
+
+    /// Redoes the handshake after the backend lost our session, unless another caller already did.
+    async fn reinitialize(&self, seen_epoch: u64, reason: &str) -> BackendResult<()> {
+        let _guard = self.reinit_lock.lock().await;
+        if self.session_epoch.load(Ordering::SeqCst) != seen_epoch {
+            return Ok(());
+        }
+        let stale = self.session_id.lock().unwrap().take();
+        let outcome = self.handshake().await;
+        self.session_epoch.fetch_add(1, Ordering::SeqCst);
+        match outcome {
+            Ok(init) => {
+                *self.initialize_result.lock().unwrap() = Some(init);
+                self.tools_refresh.store(true, Ordering::SeqCst);
+                tracing::info!(backend_id = %self.def.id, %reason, "http backend re-initialized");
+                Ok(())
+            }
+            Err(e) => {
+                // Keep the old id so a later 404 is still recognised as a lost session.
+                let mut sid = self.session_id.lock().unwrap();
+                if sid.is_none() {
+                    *sid = stale;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `initialize` + `notifications/initialized`; no session id is sent with the first.
+    async fn handshake(&self) -> BackendResult<InitializeResult> {
+        let result = self
+            .send_request_inner(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": { "name": "headless-mcp", "version": env!("CARGO_PKG_VERSION") },
+                    "capabilities": {},
+                })),
+                true,
+            )
+            .await
+            .map_err(|f| f.error)?;
+
+        let init_result: InitializeResult = serde_json::from_value(result).map_err(|e| {
+            BackendError::new(BackendErrorKind::Protocol, format!("bad init result: {e}"))
+        })?;
+
+        // Some servers (e.g. Atlassian) reject standalone notifications; ignore.
+        let _ = self
+            .send_notification("notifications/initialized", None)
+            .await;
+        Ok(init_result)
+    }
+
+    async fn send_request_inner(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        retry: bool,
+    ) -> Result<Value, Failure> {
         let id = self.request_counter.fetch_add(1, Ordering::SeqCst) as i64;
         let extra_headers = self.modern_headers(method, params.as_ref());
         let request =
@@ -255,7 +363,10 @@ impl HttpBackend {
             BackendError::new(BackendErrorKind::Protocol, format!("serialize: {e}"))
         })?;
 
-        let (response_bytes, status, headers) = self.post_json(&body, &extra_headers).await?;
+        let sent_session = self.session_id.lock().unwrap().clone();
+        let (response_bytes, status, headers) = self
+            .post_json(&body, &extra_headers, sent_session.as_deref())
+            .await?;
 
         // Capture session ID from response (Atlassian MCP sends Mcp-Session-Id)
         if let Some(sid) = headers.get("mcp-session-id") {
@@ -296,20 +407,23 @@ impl HttpBackend {
                         self.persist_token(&token, refresh.as_deref(), expires_in).await;
 
                         // Retry
-                        let (retry_bytes, retry_status, retry_headers) = self.post_json(&body, &extra_headers).await?;
+                        let (retry_bytes, retry_status, retry_headers) = self
+                            .post_json(&body, &extra_headers, sent_session.as_deref())
+                            .await?;
                         if let Some(sid) = retry_headers.get("mcp-session-id") {
                             if let Ok(val) = sid.to_str() {
                                 *self.session_id.lock().unwrap() = Some(val.to_string());
                             }
                         }
                         if retry_status.is_success() {
-                            return Self::parse_response(&retry_bytes, &self.def.id);
+                            return Ok(Self::parse_response(&retry_bytes, &self.def.id)?);
                         }
                         let body_str = String::from_utf8_lossy(&retry_bytes);
                         return Err(BackendError::new(
                             BackendErrorKind::Auth,
                             format!("HTTP {} after OAuth2: {}", retry_status.as_u16(), body_str),
-                        ));
+                        )
+                        .into());
                     }
                     Err(e) => {
                         tracing::warn!(%e, "OAuth2 token acquisition failed");
@@ -326,13 +440,26 @@ impl HttpBackend {
             } else {
                 BackendErrorKind::Protocol
             };
-            return Err(BackendError::new(
+            let session_lost = if status == reqwest::StatusCode::NOT_FOUND && sent_session.is_some()
+            {
+                Some("HTTP 404 for the session")
+            } else {
+                session_not_initialized(&response_bytes)
+            };
+            let error = BackendError::new(
                 kind,
                 format!("HTTP {} from '{}': {}", status.as_u16(), self.def.id, body_str),
-            ));
+            );
+            return Err(Failure {
+                error,
+                session_lost,
+            });
         }
 
-        Self::parse_response(&response_bytes, &self.def.id)
+        Self::parse_response(&response_bytes, &self.def.id).map_err(|error| Failure {
+            session_lost: session_not_initialized(&response_bytes),
+            error,
+        })
     }
 
     /// Headers a 2026-07-28 request must carry; empty for legacy requests.
@@ -340,12 +467,7 @@ impl HttpBackend {
     /// Built from the body so they cannot disagree with it.
     fn modern_headers(&self, method: &str, params: Option<&Value>) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        let Some(params) = params else { return headers };
-        let Some(version) = params
-            .get("_meta")
-            .and_then(|m| m.get(META_PROTOCOL_VERSION))
-            .and_then(Value::as_str)
-        else {
+        let (Some(params), Some(version)) = (params, modern_version(params)) else {
             return headers;
         };
         let mut put = |name: HeaderName, value: &str| {
@@ -387,22 +509,12 @@ impl HttpBackend {
         let body_str = String::from_utf8_lossy(response_bytes);
         tracing::debug!(%backend_id, %body_str, "raw response");
 
-        // Handle SSE-wrapped responses (e.g. Atlassian MCP)
-        let json_bytes: Vec<u8> = if body_str.starts_with("event:") || body_str.starts_with("data:") {
-            let mut decoder = SseDecoder::new();
-            let events = decoder.feed(&body_str);
-            if let Some(event) = events.first() {
-                tracing::debug!(%backend_id, data = %event.data, "parsed SSE event");
-                event.data.as_bytes().to_vec()
-            } else {
-                return Err(BackendError::new(
-                    BackendErrorKind::Protocol,
-                    format!("empty SSE response from '{backend_id}'"),
-                ));
-            }
-        } else {
-            response_bytes.to_vec()
-        };
+        let json_bytes = json_payload(response_bytes).ok_or_else(|| {
+            BackendError::new(
+                BackendErrorKind::Protocol,
+                format!("empty SSE response from '{backend_id}'"),
+            )
+        })?;
 
         let message = decode_message(&json_bytes).map_err(|e| {
             BackendError::new(
@@ -427,6 +539,15 @@ impl HttpBackend {
         }
     }
 
+    fn session_header(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let sid = self.session_id.lock().unwrap().clone();
+        if let Some(value) = sid.and_then(|sid| HeaderValue::from_str(&sid).ok()) {
+            headers.insert(HeaderName::from_static("mcp-session-id"), value);
+        }
+        headers
+    }
+
     async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<(), BackendError> {
         let notification = JsonRpcMessage::Notification(JsonRpcNotification::new(method, params));
         let body = serde_json::to_vec(&notification).map_err(|e| {
@@ -437,6 +558,7 @@ impl HttpBackend {
         let response = client
             .post(&self.url)
             .header(CONTENT_TYPE, APPLICATION_JSON)
+            .headers(self.session_header())
             .body(body)
             .send()
             .await
@@ -487,20 +609,7 @@ impl McpBackend for HttpBackend {
             }
         }
 
-        let result = self
-            .send_request("initialize", Some(serde_json::json!({
-                "protocolVersion": "2024-11-05",
-                "clientInfo": { "name": "headless-mcp", "version": env!("CARGO_PKG_VERSION") },
-                "capabilities": {},
-            })), true)
-            .await?;
-
-        let init_result: InitializeResult = serde_json::from_value(result).map_err(|e| {
-            BackendError::new(BackendErrorKind::Protocol, format!("bad init result: {e}"))
-        })?;
-
-        // Some servers (e.g. Atlassian) reject standalone notifications; ignore.
-        let _ = self.send_notification("notifications/initialized", None).await;
+        let init_result = self.handshake().await?;
 
         *self.initialize_result.lock().unwrap() = Some(init_result.clone());
         self.connected.store(true, Ordering::SeqCst);
@@ -556,6 +665,46 @@ impl McpBackend for HttpBackend {
     }
 
     fn protocol_version(&self) -> Option<&str> { None }
+
+    fn take_tools_refresh(&self) -> bool {
+        self.tools_refresh.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// The `_meta` protocol version of a 2026-07-28 request; `None` for legacy requests.
+fn modern_version(params: Option<&Value>) -> Option<&str> {
+    params?.get("_meta")?.get(META_PROTOCOL_VERSION)?.as_str()
+}
+
+/// The JSON of a response body, unwrapping an SSE frame (e.g. Atlassian MCP); `None` for an empty one.
+fn json_payload(response_bytes: &[u8]) -> Option<Vec<u8>> {
+    let body = String::from_utf8_lossy(response_bytes);
+    if !(body.starts_with("event:") || body.starts_with("data:")) {
+        return Some(response_bytes.to_vec());
+    }
+    let events = SseDecoder::new().feed(&body);
+    let event = events.first()?;
+    tracing::debug!(data = %event.data, "parsed SSE event");
+    Some(event.data.as_bytes().to_vec())
+}
+
+/// A JSON-RPC error saying the session was never initialized, which is what a restarted backend answers.
+///
+/// Kept narrow (invalid-request or server-error code AND that wording) so ordinary errors are not retried.
+fn session_not_initialized(response_bytes: &[u8]) -> Option<&'static str> {
+    let JsonRpcMessage::ErrorResponse(resp) =
+        decode_message(&json_payload(response_bytes)?).ok()?
+    else {
+        return None;
+    };
+    let code = resp.error.code;
+    let lost = (code == -32600 || (-32099..=-32000).contains(&code))
+        && resp
+            .error
+            .message
+            .to_ascii_lowercase()
+            .contains("not initialized");
+    lost.then_some("session is not initialized")
 }
 
 /// `x-mcp-header` annotations reachable through `properties` keys only.
@@ -998,6 +1147,321 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    struct Reply {
+        status: u16,
+        body: String,
+        headers: Vec<(&'static str, String)>,
+        delay: Duration,
+    }
+
+    impl Reply {
+        fn new(status: u16, body: String) -> Self {
+            Self {
+                status,
+                body,
+                headers: vec![],
+                delay: Duration::ZERO,
+            }
+        }
+    }
+
+    /// Answers each request with `respond(rpc method, lower-cased head)`; returns the URL and every
+    /// (rpc method, head) seen, in arrival order. One task per connection.
+    async fn spawn_scripted_backend(
+        respond: impl Fn(&str, &str) -> Reply + Send + Sync + 'static,
+    ) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let respond = Arc::new(respond);
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (respond, log) = (respond.clone(), log.clone());
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut head = String::new();
+                    let mut len = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).await.unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                        head.push_str(&line.to_ascii_lowercase());
+                    }
+                    let mut body = vec![0u8; len];
+                    reader.read_exact(&mut body).await.unwrap();
+                    let rpc: Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let method = rpc["method"].as_str().unwrap_or("").to_string();
+                    log.lock().unwrap().push((method.clone(), head.clone()));
+                    let reply = respond(&method, &head);
+                    tokio::time::sleep(reply.delay).await;
+                    let extra: String = reply
+                        .headers
+                        .iter()
+                        .map(|(k, v)| format!("{k}: {v}\r\n"))
+                        .collect();
+                    let resp = format!(
+                        "HTTP/1.1 {} Reply\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        reply.status,
+                        reply.body.len(),
+                        reply.body
+                    );
+                    stream.write_all(resp.as_bytes()).await.unwrap();
+                    stream.shutdown().await.ok();
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn init_reply() -> Reply {
+        Reply::new(
+            200,
+            serde_json::json!({ "jsonrpc": "2.0", "id": 0, "result": {
+            "protocolVersion": "2024-11-05",
+            "serverInfo": { "name": "mock", "version": "1" },
+            "capabilities": {},
+        } })
+            .to_string(),
+        )
+    }
+
+    fn rpc_error(code: i64, message: &str) -> Reply {
+        Reply::new(
+            200,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 0, "error": { "code": code, "message": message },
+            })
+            .to_string(),
+        )
+    }
+
+    fn ok_call() -> Reply {
+        Reply::new(200, ok_reply(serde_json::json!({ "ok": true })).1)
+    }
+
+    const NOT_INITIALIZED: &str = "session is not initialized; call \"initialize\" first";
+
+    fn count(seen: &Arc<Mutex<Vec<(String, String)>>>, method: &str) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _)| m == method)
+            .count()
+    }
+
+    fn real_backend(url: String) -> HttpBackend {
+        let def: BackendDef = serde_json::from_value(serde_json::json!({
+            "id": "mock", "transport": "http", "url": url,
+        }))
+        .unwrap();
+        HttpBackend::new(def)
+    }
+
+    /// A backend that forgets its session when `lost` flips to true and only knows it again
+    /// after the next `initialize`.
+    fn restartable(lost: Arc<AtomicBool>) -> impl Fn(&str, &str) -> Reply + Send + Sync + 'static {
+        move |method, _head| match method {
+            "initialize" => {
+                lost.store(false, Ordering::SeqCst);
+                init_reply()
+            }
+            "notifications/initialized" => Reply::new(202, String::new()),
+            _ if lost.load(Ordering::SeqCst) => rpc_error(-32600, NOT_INITIALIZED),
+            _ => ok_call(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restarted_backend_is_initialized_again_and_the_call_retried_once() {
+        let lost = Arc::new(AtomicBool::new(false));
+        let (url, seen) = spawn_scripted_backend(restartable(lost.clone())).await;
+        let backend = real_backend(url);
+        backend.connect().await.unwrap();
+        lost.store(true, Ordering::SeqCst);
+
+        let result = backend
+            .call_tool("peers", None, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(count(&seen, "initialize"), 2);
+        assert_eq!(count(&seen, "notifications/initialized"), 2);
+        assert_eq!(count(&seen, "tools/call"), 2);
+        assert!(backend.take_tools_refresh());
+        assert!(!backend.take_tools_refresh());
+    }
+
+    #[tokio::test]
+    async fn a_404_for_a_known_session_starts_a_new_session() {
+        let (url, seen) = spawn_scripted_backend(|method, head| match method {
+            "initialize" => {
+                let mut reply = init_reply();
+                reply.headers.push(("Mcp-Session-Id", "s2".into()));
+                reply
+            }
+            "notifications/initialized" => Reply::new(202, String::new()),
+            _ if head.contains("mcp-session-id: s2\r\n") => ok_call(),
+            _ => Reply::new(404, "{}".into()),
+        })
+        .await;
+        let backend = real_backend(url);
+        backend.connected.store(true, Ordering::SeqCst);
+        *backend.session_id.lock().unwrap() = Some("s1".into());
+
+        backend
+            .call_tool("peers", None, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let log = seen.lock().unwrap().clone();
+        let methods: Vec<&str> = log.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(
+            methods,
+            [
+                "tools/call",
+                "initialize",
+                "notifications/initialized",
+                "tools/call"
+            ]
+        );
+        assert!(
+            !log[1].1.contains("mcp-session-id"),
+            "initialize must start a new session: {}",
+            log[1].1
+        );
+        assert!(log[2].1.contains("mcp-session-id: s2\r\n"), "{}", log[2].1);
+        assert!(log[3].1.contains("mcp-session-id: s2\r\n"), "{}", log[3].1);
+    }
+
+    #[tokio::test]
+    async fn a_404_without_a_session_is_not_retried() {
+        let (url, seen) = spawn_scripted_backend(|_, _| Reply::new(404, "{}".into())).await;
+        let backend = connected_backend(url);
+
+        let e = backend
+            .call_tool("peers", None, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(e.to_string().contains("404"), "{e}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn other_invalid_request_errors_are_not_retried() {
+        let (url, seen) =
+            spawn_scripted_backend(|_, _| rpc_error(-32600, "params must be an object")).await;
+        let backend = connected_backend(url);
+
+        let e = backend
+            .call_tool("peers", None, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(e.to_string().contains("params must be an object"), "{e}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_re_initialize_returns_the_original_error_without_looping() {
+        let (url, seen) = spawn_scripted_backend(|method, _| match method {
+            "initialize" => Reply::new(500, "down".into()),
+            _ => rpc_error(-32600, NOT_INITIALIZED),
+        })
+        .await;
+        let backend = connected_backend(url);
+
+        let e = backend
+            .call_tool("peers", None, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(e.to_string().contains(NOT_INITIALIZED), "{e}");
+        let methods: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect();
+        assert_eq!(methods, ["tools/call", "initialize"]);
+        assert!(!backend.take_tools_refresh());
+    }
+
+    #[tokio::test]
+    async fn a_call_that_still_fails_after_re_initialize_is_not_retried_again() {
+        let (url, seen) = spawn_scripted_backend(|method, _| match method {
+            "initialize" => init_reply(),
+            "notifications/initialized" => Reply::new(202, String::new()),
+            _ => rpc_error(-32600, NOT_INITIALIZED),
+        })
+        .await;
+        let backend = connected_backend(url);
+
+        let e = backend
+            .call_tool("peers", None, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(e.to_string().contains(NOT_INITIALIZED), "{e}");
+        assert_eq!(count(&seen, "initialize"), 1);
+        assert_eq!(count(&seen, "tools/call"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_modern_call_is_never_re_initialized() {
+        let (url, seen) = spawn_scripted_backend(|_, _| rpc_error(-32600, NOT_INITIALIZED)).await;
+        let backend = connected_backend(url);
+        let params = modern_call("peers", serde_json::json!({}));
+
+        backend
+            .request("tools/call", Some(params), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_on_a_lost_session_share_one_re_initialize() {
+        let lost = Arc::new(AtomicBool::new(false));
+        let respond = restartable(lost.clone());
+        // The error is slow, so every caller has hit the dead session before the first re-initialize ends.
+        let (url, seen) = spawn_scripted_backend(move |method, head| {
+            let mut reply = respond(method, head);
+            if method == "tools/call" {
+                reply.delay = Duration::from_millis(150);
+            }
+            reply
+        })
+        .await;
+        let backend = Arc::new(real_backend(url));
+        backend.connect().await.unwrap();
+        lost.store(true, Ordering::SeqCst);
+
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let backend = backend.clone();
+                tokio::spawn(async move {
+                    backend
+                        .call_tool("peers", None, Duration::from_secs(5))
+                        .await
+                })
+            })
+            .collect();
+        for call in calls {
+            assert_eq!(call.await.unwrap().unwrap()["ok"], true);
+        }
+
+        assert_eq!(count(&seen, "initialize"), 2);
     }
 }
 
