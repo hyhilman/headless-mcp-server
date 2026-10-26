@@ -22,7 +22,8 @@ use headless_mcp_secrets::{EncryptedFileSecretStore, SecretStore};
 use headless_mcp_wire::{
     decode_message, JsonRpcId, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, SseDecoder,
 };
-use oauth2::{OAuth2TokenManager, parse_resource_metadata_url};
+use oauth2::parse_resource_metadata_url;
+pub use oauth2::OAuth2TokenManager;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -42,9 +43,8 @@ pub struct HttpBackend {
     def: BackendDef,
     url: String,
     client: Mutex<reqwest::Client>,
-    oauth2: Option<OAuth2TokenManager>,
-    /// Encrypted token store for persisting OAuth2 tokens across restarts.
-    token_store: Option<Arc<EncryptedFileSecretStore>>,
+    /// Shared by every `HttpBackend` of this backend id (see `oauth2_manager`).
+    oauth2: Option<Arc<OAuth2TokenManager>>,
     initialize_result: Mutex<Option<InitializeResult>>,
     connected: AtomicBool,
     request_counter: AtomicU64,
@@ -89,25 +89,53 @@ impl HttpBackend {
         token_store: Option<Arc<EncryptedFileSecretStore>>,
         daemon_mode: bool,
     ) -> Self {
-        let (url, static_token, oauth2_config) = match &def.transport {
+        let oauth2 = Self::oauth2_manager(&def, token_store.clone());
+        Self::with_shared_oauth2(def, daemon_mode, oauth2)
+    }
+
+    /// The token manager for `def`, or `None` if it has no OAuth2 config.
+    ///
+    /// Build it once per backend id and pass it to every `with_shared_oauth2`: two managers over
+    /// one stored token each refresh it, and the provider retires the refresh token the loser used.
+    pub fn oauth2_manager(
+        def: &BackendDef,
+        token_store: Option<Arc<EncryptedFileSecretStore>>,
+    ) -> Option<Arc<OAuth2TokenManager>> {
+        match &def.transport {
+            BackendTransport::Http {
+                oauth2: Some(config),
+                ..
+            } => Some(Arc::new(OAuth2TokenManager::with_store(
+                config.clone(),
+                token_store,
+            ))),
+            _ => None,
+        }
+    }
+
+    /// Like `with_store`, but uses the given token manager instead of creating one.
+    pub fn with_shared_oauth2(
+        def: BackendDef,
+        daemon_mode: bool,
+        oauth2: Option<Arc<OAuth2TokenManager>>,
+    ) -> Self {
+        let (url, static_token) = match &def.transport {
             BackendTransport::Http {
                 url,
                 bearer_token,
-                oauth2,
-            } => (url.clone(), bearer_token.clone(), oauth2.clone()),
+                ..
+            } => (url.clone(), bearer_token.clone()),
             _ => panic!("HttpBackend requires an HTTP transport"),
         };
 
         let default_timeout = Duration::from_secs(def.call_timeout_secs);
         let client = Self::build_client(static_token.as_deref(), default_timeout);
-        let oauth2 = oauth2_config.map(OAuth2TokenManager::new);
 
         Self {
             def,
             url,
             client: Mutex::new(client),
             oauth2,
-            token_store,
             initialize_result: Mutex::new(None),
             connected: AtomicBool::new(false),
             request_counter: AtomicU64::new(0),
@@ -148,49 +176,6 @@ impl HttpBackend {
     fn rebuild_client_with_token(&self, token: &str) {
         let mut client = self.client.lock().unwrap();
         *client = Self::build_client(Some(token), self.default_timeout);
-    }
-
-    async fn persist_token(&self, access_token: &str, refresh_token: Option<&str>, expires_in: u64) {
-        if let Some(ref store) = self.token_store {
-            let client_id = self.oauth2.as_ref().and_then(|o| o.current_client_id());
-            token_store::save_token(store, &self.def.id, access_token, refresh_token, expires_in, client_id.as_deref()).await;
-            tracing::debug!(backend_id = %self.def.id, "OAuth2 token persisted");
-        }
-    }
-
-    /// Adopt a token another instance of this same backend may have written since we last looked.
-    ///
-    /// WHY THIS EXISTS. `build_expose_registry` constructs one `HttpBackend` PER EXPOSE BLOCK, so a
-    /// backend named in two blocks is two objects with two independent `OAuth2Manager`s — and they
-    /// share exactly one persisted entry, `oauth2:<id>:token`, which each reads once in `connect()`.
-    ///
-    /// That is survivable until the provider ROTATES refresh tokens, which Slack does: a refresh
-    /// returns a new refresh token and retires the one presented. The instance that refreshes first
-    /// updates its own memory and the store; the other still holds the retired token forever and
-    /// every later refresh returns 400. Observed on a two-profile Slack setup: the read profile
-    /// (called hourly) kept winning, and the write profile served exactly one access-token lifetime
-    /// of traffic — 23 sends over 11.5h — then failed permanently.
-    ///
-    /// So: re-read before spending our copy. A still-valid access token is adopted with its
-    /// REMAINING life (not expired-on-arrival, or we would spend a rotated refresh token to replace
-    /// a token that is fine); an expired one is adopted anyway, because its refresh token is
-    /// strictly fresher than ours.
-    async fn adopt_persisted_token(&self, oauth2: &OAuth2TokenManager) {
-        let Some(ref store) = self.token_store else { return };
-        let Some(persisted) = token_store::load_token(store, &self.def.id).await else { return };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let remaining = persisted.expires_at_unix.saturating_sub(now);
-        if let Some(cid) = persisted.client_id.as_deref() {
-            oauth2.set_dynamic_client_id(cid);
-        }
-        oauth2.set_cached_token_valid_for(
-            &persisted.access_token,
-            persisted.refresh_token(),
-            Duration::from_secs(remaining),
-        );
     }
 
     async fn post_json(
@@ -382,29 +367,11 @@ impl HttpBackend {
                 // browser, and returning here meant the daemon never spent the refresh
                 // token connect() had just loaded — every restart demanded a consent.
                 // get_token() blocks the interactive grants in daemon mode itself.
-                // A sibling instance of this backend (another expose block) may have refreshed
-                // and rotated the shared refresh token since we last read it. See
-                // `adopt_persisted_token` — without this, the losing instance 400s forever.
-                self.adopt_persisted_token(oauth2_mgr).await;
-
                 tracing::info!(backend_id = %self.def.id, "attempting OAuth2 token acquisition");
 
                 match oauth2_mgr.get_token(&self.def.id, self.daemon_mode).await {
                     Ok(token) => {
                         self.rebuild_client_with_token(&token);
-
-                        // Persist the token. Unconditional: a backend without a refresh
-                        // token still needs its access token to survive a restart, and
-                        // gating on one meant those writes were silently skipped.
-                        //
-                        // The lifetime is the token's OWN, not a flat hour. Slack issues 12h
-                        // tokens; recording them as 1h had every instance re-refreshing 11 times
-                        // more often than needed, and each refresh is a rotation another instance
-                        // can lose — the hardcoded 3600 was what made the race constant rather
-                        // than rare.
-                        let refresh = oauth2_mgr.current_refresh_token();
-                        let expires_in = oauth2_mgr.current_expires_in().unwrap_or(3600);
-                        self.persist_token(&token, refresh.as_deref(), expires_in).await;
 
                         // Retry
                         let (retry_bytes, retry_status, retry_headers) = self
@@ -591,21 +558,10 @@ impl McpBackend for HttpBackend {
                 .ok_or_else(|| BackendError::new(BackendErrorKind::Internal, "no cached init result"));
         }
 
-        // Load persisted OAuth2 token if available (async, safe inside runtime)
-        if let (Some(ref store), Some(ref oauth2)) = (&self.token_store, &self.oauth2) {
-            if let Some(persisted) = token_store::load_token(store, &self.def.id).await {
-                // Restore dynamic client_id for refresh support
-                if let Some(ref cid) = persisted.client_id {
-                    oauth2.set_dynamic_client_id(cid);
-                }
-                if persisted.is_valid() {
-                    tracing::info!(backend_id = %self.def.id, "loaded valid persisted token");
-                    self.rebuild_client_with_token(&persisted.access_token);
-                    oauth2.set_cached_token(&persisted.access_token, persisted.refresh_token());
-                } else if persisted.refresh_token().is_some() {
-                    tracing::info!(backend_id = %self.def.id, "loaded expired token, will refresh");
-                    oauth2.set_cached_token(&persisted.access_token, persisted.refresh_token());
-                }
+        if let Some(ref oauth2) = self.oauth2 {
+            if let Some(access_token) = oauth2.adopt_persisted(&self.def.id).await {
+                tracing::info!(backend_id = %self.def.id, "loaded valid persisted token");
+                self.rebuild_client_with_token(&access_token);
             }
         }
 
@@ -1085,14 +1041,9 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// Regression test for the two-instance rotation race.
-    ///
-    /// `build_expose_registry` builds one `HttpBackend` per expose block, so a backend named in two
-    /// blocks is two objects with two token caches over ONE persisted entry. Here instance B holds
-    /// the pre-rotation refresh token in memory while the store already carries the rotated one —
-    /// exactly the state the read profile leaves the write profile in. B must adopt the stored
-    /// token before spending its own; presenting the retired one gets 400 forever, which is what
-    /// took Slack sends down for 15 hours.
+    /// An instance holds the pre-rotation refresh token in memory while the store already carries
+    /// the rotated one. The provider rejects the retired token; the hub must fall back to the
+    /// stored one instead of failing every later call with 400.
     #[tokio::test]
     async fn a_second_instance_adopts_a_rotated_token_instead_of_spending_a_retired_one() {
         let backend_url = spawn_flaky_backend().await;
@@ -1145,6 +1096,269 @@ mod tests {
             Some("next-refresh"),
             "the rotated refresh token must be persisted for the sibling instance"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What the rotating token endpoint saw and holds.
+    struct Issuer {
+        hits: std::sync::atomic::AtomicUsize,
+        /// The only refresh token the provider honours right now.
+        live: Mutex<String>,
+    }
+
+    /// Another process (`headless-mcp auth`) that re-authorises while a refresh is in flight.
+    struct OtherWriter {
+        store: Arc<EncryptedFileSecretStore>,
+        backend_id: &'static str,
+        refresh_token: &'static str,
+    }
+
+    fn form_value(form: &str, key: &str) -> Option<String> {
+        form.split('&')
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(str::to_string))
+    }
+
+    /// A token endpoint that ROTATES like Notion and Slack: it honours only the live refresh token,
+    /// retires it on use, issues `access-N` / `rt-N`, and answers 400 to anything else. The delay
+    /// keeps concurrent refreshes in flight together. `other_writer` runs just before a rejection.
+    async fn spawn_rotating_issuer(
+        live: &str,
+        delay: Duration,
+        other_writer: Option<OtherWriter>,
+    ) -> (String, Arc<Issuer>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let issuer = Arc::new(Issuer {
+            hits: std::sync::atomic::AtomicUsize::new(0),
+            live: Mutex::new(live.to_string()),
+        });
+        let state = issuer.clone();
+        let other_writer = Arc::new(other_writer);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (state, other_writer) = (state.clone(), other_writer.clone());
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut len = 0usize;
+                    loop {
+                        let mut h = String::new();
+                        reader.read_line(&mut h).await.unwrap();
+                        if h == "\r\n" || h.is_empty() {
+                            break;
+                        }
+                        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; len];
+                    reader.read_exact(&mut body).await.unwrap();
+                    let presented = form_value(&String::from_utf8_lossy(&body), "refresh_token");
+
+                    let n = state.hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    let accepted = {
+                        let mut live = state.live.lock().unwrap();
+                        let ok = presented.as_deref() == Some(live.as_str());
+                        if ok {
+                            *live = format!("rt-{n}");
+                        }
+                        ok
+                    };
+                    tokio::time::sleep(delay).await;
+                    if accepted {
+                        let ok = serde_json::json!({
+                            "access_token": format!("access-{n}"),
+                            "refresh_token": format!("rt-{n}"),
+                            "token_type": "bearer",
+                            "expires_in": 3600,
+                        })
+                        .to_string();
+                        write_response(&mut stream, 200, "OK", &ok).await;
+                    } else {
+                        if let Some(w) = other_writer.as_ref() {
+                            token_store::save_token(
+                                &w.store,
+                                w.backend_id,
+                                "auth-access",
+                                Some(w.refresh_token),
+                                0,
+                                Some("test-client"),
+                            )
+                            .await;
+                        }
+                        write_response(
+                            &mut stream,
+                            400,
+                            "Bad Request",
+                            "{\"error\":\"invalid_grant\"}",
+                        )
+                        .await;
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), issuer)
+    }
+
+    /// A protected MCP backend: 401 until the request carries an `access-N` token.
+    async fn spawn_protected_backend() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        spawn_scripted_backend(|method, head| match method {
+            "" => Reply::new(404, "{}".into()),
+            _ if head.contains("authorization: bearer access-") => ok_call(),
+            _ => Reply::new(401, "{}".into()),
+        })
+        .await
+    }
+
+    fn oauth_def(id: &str, backend_url: &str, token_url: &str) -> BackendDef {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "transport": "http",
+            "url": backend_url,
+            "oauth2": {
+                "token_endpoint": token_url,
+                "client_id": "test-client",
+                "client_secret": "test-secret",
+            },
+        }))
+        .unwrap()
+    }
+
+    fn temp_store(name: &str) -> (Arc<EncryptedFileSecretStore>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hmcp-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = EncryptedFileSecretStore::with_master_key_hex(
+            dir.join("secrets.json"),
+            &"ab".repeat(32),
+        )
+        .unwrap();
+        (Arc::new(store), dir)
+    }
+
+    /// Two expose blocks naming one backend, wired as `build_expose_registry` does: one shared
+    /// token manager, loaded from the store as `connect()` does.
+    async fn expose_pair(
+        def: &BackendDef,
+        store: &Arc<EncryptedFileSecretStore>,
+    ) -> (HttpBackend, HttpBackend) {
+        let oauth2 = HttpBackend::oauth2_manager(def, Some(store.clone()));
+        oauth2.as_ref().unwrap().adopt_persisted(&def.id).await;
+        let pair =
+            [(); 2].map(|_| HttpBackend::with_shared_oauth2(def.clone(), true, oauth2.clone()));
+        let [a, b] = pair;
+        a.connected.store(true, Ordering::SeqCst);
+        b.connected.store(true, Ordering::SeqCst);
+        (a, b)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_expose_blocks_of_one_backend_refresh_once_and_agree_on_the_token() {
+        let (backend_url, seen) = spawn_protected_backend().await;
+        let (token_url, issuer) =
+            spawn_rotating_issuer("rt-0", Duration::from_millis(150), None).await;
+        let (store, dir) = temp_store("shared-refresh");
+        token_store::save_token(
+            &store,
+            "shared",
+            "old-access",
+            Some("rt-0"),
+            0,
+            Some("test-client"),
+        )
+        .await;
+        let (a, b) = expose_pair(&oauth_def("shared", &backend_url, &token_url), &store).await;
+
+        let (ra, rb) = tokio::join!(
+            a.call_tool("some.tool", None, Duration::from_secs(5)),
+            b.call_tool("some.tool", None, Duration::from_secs(5)),
+        );
+
+        assert!(
+            ra.is_ok() && rb.is_ok(),
+            "both callers must succeed: {ra:?} / {rb:?}"
+        );
+        assert_eq!(
+            issuer.hits.load(Ordering::SeqCst),
+            1,
+            "the token endpoint must be hit exactly once"
+        );
+        let tokens: std::collections::HashSet<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, head)| {
+                head.lines()
+                    .find_map(|l| l.strip_prefix("authorization: bearer "))
+            })
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            tokens,
+            ["access-1".to_string()].into(),
+            "both callers must use the same access token"
+        );
+        let stored = token_store::load_token(&store, "shared").await.unwrap();
+        assert_eq!(
+            stored.refresh_token(),
+            Some(issuer.live.lock().unwrap().as_str()),
+            "the store must hold the last refresh token the provider issued"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `headless-mcp auth` re-authorises (new refresh token in the store) while this backend still
+    /// holds the old one: the provider rejects the old token, and the hub must re-read the store.
+    #[tokio::test]
+    async fn a_rejected_refresh_adopts_the_token_another_writer_stored() {
+        let (backend_url, _seen) = spawn_protected_backend().await;
+        let (store, dir) = temp_store("rejected-refresh");
+        let (token_url, issuer) = spawn_rotating_issuer(
+            "rt-fresh",
+            Duration::ZERO,
+            Some(OtherWriter {
+                store: store.clone(),
+                backend_id: "authed",
+                refresh_token: "rt-fresh",
+            }),
+        )
+        .await;
+        token_store::save_token(
+            &store,
+            "authed",
+            "old-access",
+            Some("rt-old"),
+            0,
+            Some("test-client"),
+        )
+        .await;
+        let backend = HttpBackend::with_store(
+            oauth_def("authed", &backend_url, &token_url),
+            Some(store.clone()),
+            true,
+        );
+        backend.connected.store(true, Ordering::SeqCst);
+        backend
+            .oauth2
+            .as_ref()
+            .unwrap()
+            .set_cached_token("old-access", Some("rt-old"));
+
+        let result = backend
+            .call_tool("some.tool", None, Duration::from_secs(5))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a rejected refresh must retry with the stored token: {result:?}"
+        );
+        assert_eq!(
+            issuer.hits.load(Ordering::SeqCst),
+            2,
+            "one rejected refresh, one accepted"
+        );
+        let stored = token_store::load_token(&store, "authed").await.unwrap();
+        assert_eq!(stored.refresh_token(), Some("rt-2"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

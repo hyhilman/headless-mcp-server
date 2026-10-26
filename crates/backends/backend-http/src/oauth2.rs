@@ -6,8 +6,11 @@
 //! - Authorization code + PKCE grant (interactive, with local callback server)
 //! - Automatic token refresh
 
+use crate::token_store::{self, PersistedToken};
 use headless_mcp_core::{BackendError, BackendErrorKind, OAuth2Config};
+use headless_mcp_secrets::EncryptedFileSecretStore;
 use serde::Deserialize;
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -53,9 +56,29 @@ struct TokenCache {
     expires_at: Instant,
 }
 
+/// A failed refresh; `rejected` means the token endpoint refused the refresh token itself.
+struct RefreshFailure {
+    error: BackendError,
+    rejected: bool,
+}
+
+impl From<BackendError> for RefreshFailure {
+    fn from(error: BackendError) -> Self {
+        Self {
+            error,
+            rejected: false,
+        }
+    }
+}
+
 /// Manages OAuth2 token lifecycle for an HTTP backend.
+///
+/// Share one per backend id: the refresh lock and the persisted token are per backend, so two
+/// managers over one stored token race to rotate its refresh token.
 pub struct OAuth2TokenManager {
     config: OAuth2Config,
+    /// Where refreshed tokens are written, while the refresh lock is still held.
+    store: Option<Arc<EncryptedFileSecretStore>>,
     /// Cached token.
     token_cache: Mutex<Option<TokenCache>>,
     /// Discovered metadata from 401 responses.
@@ -68,8 +91,13 @@ pub struct OAuth2TokenManager {
 
 impl OAuth2TokenManager {
     pub fn new(config: OAuth2Config) -> Self {
+        Self::with_store(config, None)
+    }
+
+    pub fn with_store(config: OAuth2Config, store: Option<Arc<EncryptedFileSecretStore>>) -> Self {
         Self {
             config,
+            store,
             token_cache: Mutex::new(None),
             discovered: StdMutex::new(None),
             client: reqwest::Client::new(),
@@ -77,7 +105,8 @@ impl OAuth2TokenManager {
         }
     }
 
-    /// Load a cached token (from persistence layer).
+    /// Test helper: load a token that is already expired.
+    #[cfg(test)]
     pub fn set_cached_token(&self, access_token: &str, refresh_token: Option<&str>) {
         let mut cache = self.token_cache.try_lock().expect("token_cache");
         // Keep any dynamically registered client_id already in the cache. A refresh
@@ -97,70 +126,78 @@ impl OAuth2TokenManager {
         });
     }
 
-    /// Load a cached token that still has life left in it.
+    /// Replace the cache with a stored token, keeping its real remaining life.
     ///
-    /// `set_cached_token` deliberately marks the token expired-on-arrival so the first use forces a
-    /// refresh, which is right for `connect()`. It is wrong when the token was just written by
-    /// ANOTHER instance of this same backend: there the access token is live, and treating it as
-    /// expired spends a refresh token that has already been rotated away.
-    pub fn set_cached_token_valid_for(
-        &self,
-        access_token: &str,
-        refresh_token: Option<&str>,
-        valid_for: Duration,
-    ) {
-        let mut cache = self.token_cache.try_lock().expect("token_cache");
+    /// Call with the refresh lock held, or a refresh in flight could be overwritten.
+    async fn install_persisted(&self, persisted: &PersistedToken) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let remaining = Duration::from_secs(persisted.expires_at_unix.saturating_sub(now));
+        let mut cache = self.token_cache.lock().await;
         let client_id = self
             .config
             .client_id
             .clone()
+            .or_else(|| persisted.client_id.clone())
             .or_else(|| cache.as_ref().and_then(|c| c.client_id.clone()));
         *cache = Some(TokenCache {
-            access_token: access_token.to_string(),
-            refresh_token: refresh_token.map(|s| s.to_string()),
+            access_token: persisted.access_token.clone(),
+            refresh_token: persisted.refresh_token.clone(),
             client_id,
-            expires_at: Instant::now() + valid_for,
+            expires_at: Instant::now() + remaining,
         });
     }
 
-    /// Seconds of life left on the cached access token, for persisting a real expiry.
-    pub fn current_expires_in(&self) -> Option<u64> {
-        let cache = self.token_cache.try_lock().ok()?;
-        let cached = cache.as_ref()?;
-        Some(
-            cached
-                .expires_at
-                .saturating_duration_since(Instant::now())
-                .as_secs(),
-        )
+    /// Load the stored token into an empty cache; for `connect()`.
+    ///
+    /// A cache that already holds a token is newer than the store (every refresh is written
+    /// through under the refresh lock), so a second backend sharing this manager keeps it.
+    /// Returns the access token if it is still usable.
+    pub async fn adopt_persisted(&self, backend_id: &str) -> Option<String> {
+        let store = self.store.as_ref()?;
+        let _guard = self.refresh_lock.lock().await;
+        if let Some(cached) = self.token_cache.lock().await.as_ref() {
+            if !cached.access_token.is_empty() {
+                return None;
+            }
+        }
+        let persisted = token_store::load_token(store, backend_id).await?;
+        if !persisted.is_valid() && persisted.refresh_token().is_none() {
+            return None;
+        }
+        self.install_persisted(&persisted).await;
+        persisted.is_valid().then_some(persisted.access_token)
     }
 
     /// Store a dynamically registered client_id for refresh support.
-    pub fn set_dynamic_client_id(&self, client_id: &str) {
-        if let Ok(mut cache) = self.token_cache.try_lock() {
-            if let Some(ref mut c) = *cache {
-                c.client_id = Some(client_id.to_string());
-            } else {
-                *cache = Some(TokenCache {
-                    access_token: String::new(),
-                    refresh_token: None,
-                    client_id: Some(client_id.to_string()),
-                    expires_at: Instant::now(),
-                });
-            }
+    pub async fn set_dynamic_client_id(&self, client_id: &str) {
+        let mut cache = self.token_cache.lock().await;
+        if let Some(ref mut c) = *cache {
+            c.client_id = Some(client_id.to_string());
+        } else {
+            *cache = Some(TokenCache {
+                access_token: String::new(),
+                refresh_token: None,
+                client_id: Some(client_id.to_string()),
+                expires_at: Instant::now(),
+            });
         }
     }
 
-    /// Return current refresh token for persistence.
+    /// Test helper: the refresh token currently cached.
+    #[cfg(test)]
     pub fn current_refresh_token(&self) -> Option<String> {
         self.token_cache.try_lock().ok()?.as_ref()?.refresh_token.clone()
     }
 
     /// Return the current client_id (from config or dynamic registration).
-    pub fn current_client_id(&self) -> Option<String> {
-        self.config.client_id.clone().or_else(|| {
-            self.token_cache.try_lock().ok()?.as_ref()?.client_id.clone()
-        })
+    pub async fn current_client_id(&self) -> Option<String> {
+        if let Some(id) = self.config.client_id.clone() {
+            return Some(id);
+        }
+        self.token_cache.lock().await.as_ref()?.client_id.clone()
     }
 
     /// Get a valid access token.
@@ -271,31 +308,43 @@ impl OAuth2TokenManager {
                 }
 
                 // Try refresh if we have a refresh token
-                if let Some(refresh_token) = cached.refresh_token.clone() {
+                if cached.refresh_token.is_some() {
                     drop(cache);
                     let _guard = self.refresh_lock.lock().await;
-                    // Re-check after acquiring lock
-                    {
+                    // Re-read after the lock: whoever held it may have refreshed and rotated the token.
+                    let refresh_token = {
                         let cache = self.token_cache.lock().await;
-                        if let Some(cached) = cache.as_ref() {
-                            if cached.expires_at > Instant::now() + Duration::from_secs(30) {
-                                return Ok(cached.access_token.clone());
+                        match cache.as_ref() {
+                            Some(c) if c.expires_at > Instant::now() + Duration::from_secs(30) => {
+                                return Ok(c.access_token.clone());
                             }
+                            Some(c) => c.refresh_token.clone(),
+                            None => None,
                         }
-                    }
+                    };
 
-                    tracing::debug!(%backend_id, "attempting token refresh");
-                    match self.do_refresh(&refresh_token, backend_id).await {
-                        Ok(new_token) => return Ok(new_token),
-                        Err(e) => {
-                            tracing::warn!(%e, "token refresh failed");
-                            if daemon_mode {
-                                return Err(BackendError::new(
-                                    BackendErrorKind::Auth,
-                                    format!("token refresh failed (daemon mode): {e}"),
-                                ));
+                    if let Some(refresh_token) = refresh_token {
+                        tracing::debug!(%backend_id, "attempting token refresh");
+                        match self.do_refresh(&refresh_token, backend_id).await {
+                            Ok(new_token) => return Ok(new_token),
+                            Err(failure) => {
+                                if failure.rejected {
+                                    if let Some(token) =
+                                        self.retry_with_stored(&refresh_token, backend_id).await
+                                    {
+                                        return Ok(token);
+                                    }
+                                }
+                                let e = failure.error;
+                                tracing::warn!(%e, "token refresh failed");
+                                if daemon_mode {
+                                    return Err(BackendError::new(
+                                        BackendErrorKind::Auth,
+                                        format!("token refresh failed (daemon mode): {e}"),
+                                    ));
+                                }
+                                // Non-daemon: fall through to interactive re-auth
                             }
-                            // Non-daemon: fall through to interactive re-auth
                         }
                     }
                 } else if daemon_mode {
@@ -350,6 +399,22 @@ impl OAuth2TokenManager {
                 format!("unsupported OAuth2 grant type: {other}"),
             )),
         }
+    }
+
+    /// After a rejected refresh, adopt a token another writer stored since we loaded ours
+    /// (e.g. `headless-mcp auth` run in the container), and use it once. Needs the refresh lock.
+    async fn retry_with_stored(&self, rejected: &str, backend_id: &str) -> Option<String> {
+        let stored = token_store::load_token(self.store.as_ref()?, backend_id).await?;
+        if stored.refresh_token() == Some(rejected) {
+            return None;
+        }
+        tracing::info!(%backend_id, "refresh rejected; adopting the token another writer stored");
+        self.install_persisted(&stored).await;
+        if stored.is_valid() {
+            return Some(stored.access_token);
+        }
+        let refresh_token = stored.refresh_token.as_deref()?;
+        self.do_refresh(refresh_token, backend_id).await.ok()
     }
 
     fn resolve_token_endpoint(&self) -> Result<String, BackendError> {
@@ -458,7 +523,7 @@ impl OAuth2TokenManager {
             };
             if let Some(_ep) = reg_endpoint {
                 let (cid, cs) = self.register_client(backend_id).await?;
-                self.set_dynamic_client_id(&cid);
+                self.set_dynamic_client_id(&cid).await;
                 (cid, cs.unwrap_or_default())
             } else {
                 return Err(BackendError::new(
@@ -546,7 +611,7 @@ impl OAuth2TokenManager {
                 Some(ep) => {
                     tracing::info!(%backend_id, %ep, "no client_id, attempting dynamic registration");
                     let cid = self.register_client(backend_id).await?.0;
-                    self.set_dynamic_client_id(&cid);
+                    self.set_dynamic_client_id(&cid).await;
                     cid
                 }
                 None => {
@@ -677,9 +742,9 @@ impl OAuth2TokenManager {
         &self,
         refresh_token: &str,
         backend_id: &str,
-    ) -> Result<String, BackendError> {
+    ) -> Result<String, RefreshFailure> {
         let token_endpoint = self.resolve_token_endpoint()?;
-        let client_id = self.current_client_id().unwrap_or_default();
+        let client_id = self.current_client_id().await.unwrap_or_default();
         let client_secret = self.config.client_secret.as_deref().unwrap_or("");
 
         tracing::debug!(%backend_id, "refreshing OAuth2 token");
@@ -713,13 +778,16 @@ impl OAuth2TokenManager {
                 .get("error_description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
-            return Err(BackendError::new(
-                BackendErrorKind::Auth,
-                format!("refresh failed ({status}): {error_desc}"),
-            ));
+            return Err(RefreshFailure {
+                error: BackendError::new(
+                    BackendErrorKind::Auth,
+                    format!("refresh failed ({status}): {error_desc}"),
+                ),
+                rejected: matches!(status.as_u16(), 400 | 401),
+            });
         }
 
-        self.cache_token_response(&body, backend_id).await
+        Ok(self.cache_token_response(&body, backend_id).await?)
     }
 
     async fn cache_token_response(
@@ -734,25 +802,51 @@ impl OAuth2TokenManager {
                 BackendError::new(BackendErrorKind::Auth, "response missing 'access_token'")
             })?;
 
+        let expires_in = body
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3600);
+        let expires_at = Instant::now() + Duration::from_secs(expires_in);
+
+        // One guard for the read and the write: the try_lock getters return None when another
+        // backend sharing this manager is reading the cache, which would drop the refresh token.
+        let mut cache = self.token_cache.lock().await;
+        let previous = cache.as_ref();
         // RFC 6749 §6 makes refresh_token optional in a refresh response; when it is
-        // absent the old one stays valid. Dropping it here left the manager with no
-        // refresh token, which also skipped persistence (the caller only writes when
-        // one is present) — so a successful refresh never reached disk.
+        // absent the old one stays valid.
         let refresh_token = body
             .get("refresh_token")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .or_else(|| self.current_refresh_token());
-        let expires_in = body.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
-        let expires_at = Instant::now() + Duration::from_secs(expires_in);
-        let client_id = self.current_client_id();
+            .or_else(|| previous.and_then(|c| c.refresh_token.clone()));
+        let client_id = self
+            .config
+            .client_id
+            .clone()
+            .or_else(|| previous.and_then(|c| c.client_id.clone()));
 
-        *self.token_cache.lock().await = Some(TokenCache {
+        *cache = Some(TokenCache {
             access_token: access_token.to_string(),
-            refresh_token,
-            client_id,
+            refresh_token: refresh_token.clone(),
+            client_id: client_id.clone(),
             expires_at,
         });
+        drop(cache);
+
+        // Written while the caller still holds the refresh lock, so no other caller can read the
+        // retired refresh token from the store between our refresh and this write.
+        if let Some(ref store) = self.store {
+            token_store::save_token(
+                store,
+                backend_id,
+                access_token,
+                refresh_token.as_deref(),
+                expires_in,
+                client_id.as_deref(),
+            )
+            .await;
+            tracing::debug!(%backend_id, "OAuth2 token persisted");
+        }
 
         tracing::info!(%backend_id, expires_in, "OAuth2 token cached");
         Ok(access_token.to_string())
@@ -917,34 +1011,34 @@ mod tests {
     /// loads the persisted token. Loading the token must not wipe the client_id —
     /// a refresh token is only valid for the client it was issued to, so losing it
     /// made every refresh fail for Atlassian/Notion while Slack (static id) worked.
-    #[test]
-    fn set_cached_token_keeps_the_dynamic_client_id() {
+    #[tokio::test]
+    async fn set_cached_token_keeps_the_dynamic_client_id() {
         let mgr = OAuth2TokenManager::new(dcr_config());
 
-        mgr.set_dynamic_client_id("dyn-cid");
+        mgr.set_dynamic_client_id("dyn-cid").await;
         mgr.set_cached_token("access-tok", Some("refresh-tok"));
 
-        assert_eq!(mgr.current_client_id().as_deref(), Some("dyn-cid"));
+        assert_eq!(mgr.current_client_id().await.as_deref(), Some("dyn-cid"));
         assert_eq!(mgr.current_refresh_token().as_deref(), Some("refresh-tok"));
     }
 
     /// A configured client_id still wins over anything cached.
-    #[test]
-    fn config_client_id_takes_precedence() {
+    #[tokio::test]
+    async fn config_client_id_takes_precedence() {
         let mgr = OAuth2TokenManager::new(static_config());
 
-        mgr.set_dynamic_client_id("dyn-cid");
+        mgr.set_dynamic_client_id("dyn-cid").await;
         mgr.set_cached_token("access-tok", Some("refresh-tok"));
 
-        assert_eq!(mgr.current_client_id().as_deref(), Some("static-cid"));
+        assert_eq!(mgr.current_client_id().await.as_deref(), Some("static-cid"));
     }
 
     /// With no dynamic registration and no config, there is simply no client_id.
-    #[test]
-    fn no_client_id_anywhere_stays_none() {
+    #[tokio::test]
+    async fn no_client_id_anywhere_stays_none() {
         let mgr = OAuth2TokenManager::new(dcr_config());
         mgr.set_cached_token("access-tok", Some("refresh-tok"));
-        assert_eq!(mgr.current_client_id(), None);
+        assert_eq!(mgr.current_client_id().await, None);
     }
 
     /// RFC 6749 §6: refresh_token is optional in a refresh response; when omitted
@@ -953,7 +1047,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_response_without_a_refresh_token_keeps_the_old_one() {
         let mgr = OAuth2TokenManager::new(dcr_config());
-        mgr.set_dynamic_client_id("dyn-cid");
+        mgr.set_dynamic_client_id("dyn-cid").await;
         mgr.set_cached_token("old-access", Some("keep-me"));
 
         let body = serde_json::json!({ "access_token": "new-access", "expires_in": 3600 });
@@ -961,7 +1055,7 @@ mod tests {
 
         assert_eq!(token, "new-access");
         assert_eq!(mgr.current_refresh_token().as_deref(), Some("keep-me"));
-        assert_eq!(mgr.current_client_id().as_deref(), Some("dyn-cid"));
+        assert_eq!(mgr.current_client_id().await.as_deref(), Some("dyn-cid"));
     }
 
     /// A rotated refresh token in the response replaces the old one.
