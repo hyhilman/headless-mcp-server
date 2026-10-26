@@ -4,11 +4,13 @@
 mod config;
 mod one_shot;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use headless_mcp_backend_http::{HttpBackend, OAuth2TokenManager};
 use headless_mcp_core::{BackendTransport, McpBackend};
 use headless_mcp_registry::BackendRegistry;
 use headless_mcp_server::{McpSession, TracingAuditLogger};
@@ -186,10 +188,21 @@ async fn run_serve(
         let rate_limit = cfg.auth.as_ref().map_or(DEFAULT_RATE_LIMIT, |a| a.rate_limit);
         let mut handles = Vec::new();
         let expose_blocks = std::mem::take(&mut cfg.expose);
+        // One token manager per backend id, shared by every expose block that names it.
+        let oauth2: HashMap<String, Arc<OAuth2TokenManager>> = cfg
+            .backends
+            .iter()
+            .filter_map(|def| {
+                Some((
+                    def.id.clone(),
+                    HttpBackend::oauth2_manager(def, store.clone())?,
+                ))
+            })
+            .collect();
         for eb in expose_blocks {
             let label = eb.label.clone().unwrap_or_else(|| eb.port.to_string());
             let addr: SocketAddr = bind_addr_from_expose(eb.port);
-            let reg = build_expose_registry(&cfg, &eb, store.clone(), daemon).await?;
+            let reg = build_expose_registry(&cfg, &eb, &oauth2, daemon).await?;
             for (id, r) in &reg.connect_all().await {
                 if let Err(e) = r { tracing::warn!(%id, %label, %e, "connect failed"); }
             }
@@ -254,7 +267,7 @@ fn bind_addr_from_expose(port: u16) -> SocketAddr {
 async fn build_expose_registry(
     cfg: &config::HubConfig,
     eb: &config::ExposeBlock,
-    store: Option<Arc<EncryptedFileSecretStore>>,
+    oauth2: &HashMap<String, Arc<OAuth2TokenManager>>,
     daemon: bool,
 ) -> Result<BackendRegistry, Box<dyn std::error::Error>> {
     let reg = BackendRegistry::new();
@@ -270,8 +283,8 @@ async fn build_expose_registry(
                     Arc::new(headless_mcp_backend_stdio::StdioBackend::new(def.clone()))
                 }
                 BackendTransport::Http { .. } => {
-                    Arc::new(headless_mcp_backend_http::HttpBackend::with_store(
-                        def.clone(), store.clone(), daemon,
+                    Arc::new(HttpBackend::with_shared_oauth2(
+                        def.clone(), daemon, oauth2.get(&def.id).cloned(),
                     ))
                 }
             };

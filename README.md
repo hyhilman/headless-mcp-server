@@ -184,6 +184,13 @@ to disk.
 After that one-time auth, the hub auto-refreshes the token before expiry —
 you never interact with it again, even across restarts.
 
+Providers such as Notion and Slack retire a refresh token when it is used. The
+hub keeps one token manager per backend, even when several `expose` blocks use
+that backend, and saves each new token before any other call can read the old
+one. If the provider rejects a refresh and the stored token has changed (for
+example you ran `headless-mcp auth` in the container), the hub uses the stored
+token once.
+
 To persist tokens across restarts, set `HEADLESS_MCP_MASTER_KEY` to a
 64-character hex string (32 bytes for AES-256-GCM):
 
